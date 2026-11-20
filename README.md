@@ -123,7 +123,12 @@ snow --version
 
 DCM Projects require Snowflake CLI 3.24.0 or later. This project's manifest
 format was verified against CLI 3.34.0 and Snowflake's official DCM project
-documentation. Configure a named Snowflake CLI connection using the
+documentation. The `DEV` target in `manifest.yml` is configured with account
+identifier `GIMFDUR-DY25356`, project name
+`SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV`, and project owner
+`ACCOUNTADMIN`. Use a named Snowflake CLI connection for that account and
+confirm the configured owner has the needed privileges. Configure the
+connection using the
 [Snowflake CLI connection guide](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/connect).
 Do not put credentials in this repository. `.env.example` contains a blank
 bucket setting and default prefixes only; set the bucket and prefixes in the
@@ -132,9 +137,10 @@ organization's approved secret manager are responsible for authentication.
 
 ### First-time DCM setup
 
-The example `DEV` target in `manifest.yml` contains clearly marked
-account/role/project placeholders. Replace them with values for your Snowflake
-account before running DCM commands. The DCM project object is located in
+The `DEV` target uses the configured account identifier, project name, and
+project owner documented above; it is not a placeholder template. Confirm that
+the Snowflake CLI connection targets that account and that the configured
+owner has the required privileges. The DCM project object is located in
 `SKYPOINTS_DB.AUDIT`, so bootstrap that database and schema first using an
 authorized Snowflake CLI connection:
 
@@ -244,9 +250,9 @@ account as part of this phase.
 - The DCM project object is hosted in `SKYPOINTS_DB.AUDIT`. The first-time
   bootstrap therefore requires privileges to create that database and schema,
   and to create a DCM project there.
-- The `DEV` manifest target is a template, not a usable account configuration.
-  The account identifier, project owner role, and project object must be
-  verified and replaced by the account administrator.
+- The `DEV` manifest target uses the account identifier, project name, and
+  project owner documented above. Verify those account-specific settings and
+  privileges before DCM deployment; the manifest is not modified by Phase 3.
 - AWS resources and credentials are not provisioned by this repository.
   Storage integration, bucket event notifications, and actual Snowflake
   deployment require account-specific setup and have not been run here.

@@ -285,11 +285,20 @@ BEGIN
         'redemptions', v_redemption_files
     );
 
-    IF (v_member_invalid_count > 0 OR v_redemption_invalid_count > 0) THEN
+    IF (
+        v_member_row_count = 0
+        OR v_redemption_row_count = 0
+        OR v_member_invalid_count > 0
+        OR v_redemption_invalid_count > 0
+    ) THEN
         v_error_details :=
-            'Critical null checks failed: member_invalid='
+            'Raw table validation failed: member_row_count='
+            || v_member_row_count
+            || ', redemption_row_count='
+            || v_redemption_row_count
+            || ', member_invalid_count='
             || v_member_invalid_count
-            || ', redemption_invalid='
+            || ', redemption_invalid_count='
             || v_redemption_invalid_count;
         RAISE e_validation_failed;
     END IF;
@@ -334,14 +343,14 @@ AS
 
 CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION
     WAREHOUSE = 'SKYPOINTS_ETL_WH'
-    AFTER SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION
     COMMENT = 'Copy staged redemption documents after member ingestion succeeds'
+    AFTER SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION
 AS
     CALL SKYPOINTS_DB.RAW.SP_RUN_REDEMPTION_INGESTION();
 
 CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION
     WAREHOUSE = 'SKYPOINTS_ETL_WH'
-    AFTER SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION
     COMMENT = 'Validate both raw tables after both ingestion tasks succeed'
+    AFTER SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION
 AS
     CALL SKYPOINTS_DB.RAW.SP_RUN_INGESTION_VALIDATION();

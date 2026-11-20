@@ -70,8 +70,9 @@ the same S3 prefixes.
 Every procedure writes a `RUNNING` audit row, then records `SUCCEEDED` or
 `FAILED`, start/end timestamps, run ID, loaded row count, source files, and
 error details. The validation task records both raw-table row counts and the
-member/redemption source-file lists. Critical NULL checks fail the task and
-prevent downstream success. Exceptions are re-raised after audit updates, so
+member/redemption source-file lists. Critical NULL checks and empty raw tables
+fail validation and prevent downstream success. Exceptions are re-raised after
+audit updates, so
 Snowflake task history also reports the failure. Failures before a procedure
 starts (for example, task privilege or warehouse errors) are visible in task
 history even if no audit row was started.

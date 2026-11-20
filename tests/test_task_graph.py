@@ -13,6 +13,9 @@ EXECUTION = (
 MONITORING = (
     ORCHESTRATION / "monitor_ingestion_task_graph.sql"
 ).read_text(encoding="utf-8")
+VALIDATION_PROCEDURE = DEPLOYMENT.split(
+    "CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.RAW.SP_RUN_INGESTION_VALIDATION()"
+)[1].split("CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION")[0]
 
 
 def test_task_graph_has_three_fully_qualified_tasks_in_dependency_order() -> None:
@@ -42,6 +45,33 @@ def test_deployment_leaves_the_graph_suspended_and_without_a_schedule() -> None:
     assert "SCHEDULE =" not in DEPLOYMENT.upper()
     assert "ALTER TASK" not in DEPLOYMENT.upper()
     assert "RESUME" not in DEPLOYMENT.upper()
+
+
+def test_create_task_clauses_follow_snowflake_syntax_order() -> None:
+    task_statements = re.findall(
+        r"CREATE OR REPLACE TASK\s+.*?\nAS\s+CALL\s+[^;]+;",
+        DEPLOYMENT,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert len(task_statements) == 3
+
+    for statement in task_statements:
+        warehouse_position = statement.index("WAREHOUSE =")
+        comment_position = statement.index("COMMENT =")
+        as_position = statement.index("\nAS")
+        assert warehouse_position < comment_position < as_position
+
+        task_name = re.search(
+            r"CREATE OR REPLACE TASK\s+([\w.]+)",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        assert task_name is not None
+        if not task_name.group(1).endswith(".TASK_MEMBER_INGESTION"):
+            after_position = statement.index("AFTER SKYPOINTS_DB.RAW.")
+            assert comment_position < after_position < as_position
+        else:
+            assert "AFTER " not in statement
 
 
 def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
@@ -78,6 +108,31 @@ def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
         "SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')"
         in DEPLOYMENT
     )
+    assert DEPLOYMENT.count(
+        "SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')"
+    ) == 3
+    assert DEPLOYMENT.count("v_copy_query_id := LAST_QUERY_ID();") == 2
+    assert DEPLOYMENT.count("SUM(ROWS_LOADED)") == 2
+    assert DEPLOYMENT.count("ARRAY_AGG(DISTINCT FILE)") == 2
+    assert DEPLOYMENT.count("RESULT_SCAN(:v_copy_query_id)") == 2
+
+
+def test_validation_fails_for_empty_member_table() -> None:
+    assert "v_member_row_count = 0" in VALIDATION_PROCEDURE
+    assert "member_row_count=" in VALIDATION_PROCEDURE
+
+
+def test_validation_fails_for_empty_redemption_table() -> None:
+    assert "v_redemption_row_count = 0" in VALIDATION_PROCEDURE
+    assert "redemption_row_count=" in VALIDATION_PROCEDURE
+
+
+def test_validation_audits_meaningful_failure_details_and_reraises() -> None:
+    assert "member_invalid_count=" in VALIDATION_PROCEDURE
+    assert "redemption_invalid_count=" in VALIDATION_PROCEDURE
+    assert "ERROR_DETAILS = COALESCE(:v_error_details, :SQLERRM)" in VALIDATION_PROCEDURE
+    assert "RAISE e_validation_failed;" in VALIDATION_PROCEDURE
+    assert "RAISE;" in VALIDATION_PROCEDURE
 
 
 def test_audit_and_validation_capture_counts_sources_and_critical_nulls() -> None:
@@ -103,7 +158,7 @@ def test_audit_and_validation_capture_counts_sources_and_critical_nulls() -> Non
         "SOURCE_FILE_CONTENT_KEY IS NULL",
         "INGESTED_AT IS NULL",
     ):
-        assert check in DEPLOYMENT
+        assert check in VALIDATION_PROCEDURE
 
 
 def test_execution_and_monitoring_scripts_cover_manual_operation() -> None:
