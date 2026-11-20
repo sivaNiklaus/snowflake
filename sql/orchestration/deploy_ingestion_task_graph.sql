@@ -67,7 +67,7 @@ BEGIN
     FILE_FORMAT = (FORMAT_NAME = SKYPOINTS_DB.RAW.MEMBER_PROFILE_CSV)
     ON_ERROR = 'ABORT_STATEMENT';
 
-    v_copy_query_id := LAST_QUERY_ID();
+    v_copy_query_id := SQLID;
 
     SELECT
         COALESCE(SUM("rows_loaded"), 0),
@@ -156,7 +156,7 @@ BEGIN
     FILE_FORMAT = (FORMAT_NAME = SKYPOINTS_DB.RAW.REDEMPTION_JSON)
     ON_ERROR = 'ABORT_STATEMENT';
 
-    v_copy_query_id := LAST_QUERY_ID();
+    v_copy_query_id := SQLID;
 
     SELECT
         COALESCE(SUM("rows_loaded"), 0),
