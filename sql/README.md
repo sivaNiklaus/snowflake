@@ -1,57 +1,140 @@
 # Snowflake SQL deployment
 
-## Phase 3: manual raw ingestion
+## Phase 3: raw ingestion task graph
 
-Phase 3 reuses the already-deployed external stages, named file formats, and
-raw tables. It creates no Snowflake objects and does not run Snowpipe, Streams,
-or Tasks. The existing Phase 2 pipe scripts remain untouched; do not run them
-concurrently with this manual load workflow.
+The task graph reuses the already-deployed external stages, named file formats,
+raw tables, and the `COPY INTO` logic in the existing ingestion scripts. It
+does not recreate or modify those objects. Phase 2 pipe definitions and DCM
+definitions remain untouched.
 
 | Feed | Stage | File format | Target |
 | --- | --- | --- | --- |
 | Members | `SKYPOINTS_DB.RAW.MEMBER_S3_STAGE` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_CSV` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW` |
 | Redemptions | `SKYPOINTS_DB.RAW.REDEMPTION_S3_STAGE` | `SKYPOINTS_DB.RAW.REDEMPTION_JSON` | `SKYPOINTS_DB.RAW.REDEMPTION_RAW` |
 
-Run the load scripts from the repository root with a Snowflake connection that
-can read the stages and insert into the raw tables:
+`sql/orchestration/deploy_ingestion_task_graph.sql` creates the audit table,
+three SQL stored procedures, and three Snowflake tasks. Only the audit table,
+procedures, and tasks are managed by this script; database, schemas, warehouse,
+stages, formats, and raw tables remain the responsibility of the existing
+deployment. The procedures use the same projections as the standalone COPY
+scripts:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/deploy_ingestion_task_graph.sql
+```
+
+Run deployment with a role that can create procedures and tasks in
+`SKYPOINTS_DB.RAW`, create the audit table in `SKYPOINTS_DB.AUDIT`, use
+`SKYPOINTS_ETL_WH`, and own/operate the tasks. The task owner needs `USAGE` on
+the warehouse and the global `EXECUTE TASK` privilege. The procedures execute
+as their owner, so that role also needs access to the existing stages and raw
+tables. Use the same owning role for all tasks in the graph.
+
+The deployment script is rerunnable and does not resume or schedule tasks.
+Newly created tasks are suspended by default. It does not define a schedule.
+The graph is:
+
+1. `TASK_MEMBER_INGESTION` is the root and copies the member feed.
+2. `TASK_REDEMPTION_INGESTION` runs after successful member ingestion.
+3. `TASK_INGESTION_VALIDATION` runs after successful redemption ingestion.
+
+Each task uses `SKYPOINTS_ETL_WH`. The member copy stores `$1::VARCHAR` as
+`SOURCE_RECORD`, preserving the full physical source line. The redemption copy
+stores `$1::VARIANT` as `PAYLOAD`; neither feed is parsed or flattened.
+Both projections include filename, row number, content key, and scan timestamp,
+and use `ON_ERROR = 'ABORT_STATEMENT'` without `FORCE = TRUE`. Snowflake's
+per-table COPY load history provides file-level de-duplication on reruns.
+
+### Manual execution
+
+After deploying the graph, execute:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_task_graph.sql
+```
+
+The script resumes the two child tasks but leaves the root suspended. It then
+runs the full graph synchronously using this single trigger:
+
+```sql
+EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT;
+```
+
+The root has no schedule and remains manually triggered. Do not configure a
+daily schedule until a manual run and its validation have succeeded. Before
+running, ensure the existing auto-ingest pipes are not concurrently consuming
+the same S3 prefixes.
+
+### Audit, monitoring, and recovery
+
+Every procedure writes a `RUNNING` audit row, then records `SUCCEEDED` or
+`FAILED`, start/end timestamps, run ID, loaded row count, source files, and
+error details. The validation task records both raw-table row counts and the
+member/redemption source-file lists. Critical NULL checks fail the task and
+prevent downstream success. Exceptions are re-raised after audit updates, so
+Snowflake task history also reports the failure. Failures before a procedure
+starts (for example, task privilege or warehouse errors) are visible in task
+history even if no audit row was started.
+
+For a successful graph run, task history shows all three tasks as
+`SUCCEEDED`. The audit table has member and redemption rows with their COPY
+row/file results and a validation row with both table counts and source-file
+lists. A failed COPY or nonzero critical NULL count produces a `FAILED` task
+and an audit error message.
+
+Inspect recent task status and audit records with:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_ingestion_task_graph.sql
+```
+
+The task-history table function covers the preceding seven days; the audit
+table retains its records until explicitly managed. If a run fails, inspect
+both views, correct the source or permission issue, and manually trigger the
+root again. Successful files are skipped by Snowflake's load history; do not
+use `FORCE = TRUE`. Republish corrected content under a new S3 object key if
+the original key was already loaded.
+
+If the graph definition has not changed and the failed run is within
+Snowflake's 14-day retry window, the failed portion can instead be retried:
+
+```sql
+EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION RETRY LAST;
+```
+
+`RETRY LAST` is not synchronous and does not support `AWAIT`; monitor its
+completion with the task-history and audit queries above.
+
+The monitoring role needs task `MONITOR` or `OPERATE` privileges (or global
+`MONITOR EXECUTION`) and `USAGE` on the task database and schema.
+
+The standalone manual COPY and validation scripts remain available for
+diagnostics, but should not run concurrently with this graph or active pipes:
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/ingestion/load_member_profile.sql
 snow sql --connection <connection_name> --filename sql/ingestion/load_redemption.sql
-```
-
-The two feeds are independent; either can run first. The member script copies
-only `$1::VARCHAR` into `SOURCE_RECORD`, preserving complete lines, delimiters,
-and optional fields. The redemption script copies `$1::VARIANT` into `PAYLOAD`
-without flattening. Both populate filename, row number, content key, and
-ingestion timestamp metadata.
-
-Both statements use `ON_ERROR = 'ABORT_STATEMENT'` and omit `FORCE`.
-Snowflake's normal per-table load metadata skips files already loaded, making
-reruns safe within its load-history retention. Check COPY history before any
-intentional reprocessing or backfill.
-
-After both loads, run the matching validation scripts:
-
-```powershell
 snow sql --connection <connection_name> --filename sql/ingestion/validate_member_profile.sql
 snow sql --connection <connection_name> --filename sql/ingestion/validate_redemption.sql
 ```
 
-Expected results: counts include newly loaded files; member samples retain the
-complete source line; redemption samples remain complete `VARIANT` documents.
-Null checks should show no missing records or required metadata. Filename/time
-checks should show source files and populated ingestion timestamps. COPY
-history should report loaded files; a rerun can show `Load skipped`.
+Run local static checks with `python -m pytest`. These tests do not connect to
+or deploy against Snowflake. No Snowflake account deployment or execution is
+claimed by this repository change.
 
-Run local SQL-shape and fixture checks with `python -m pytest`. These tests do
-not connect to or deploy against Snowflake. Confirm no existing auto-ingest
-pipe is concurrently consuming the same prefixes before using manual COPY.
+Task dependencies, suspended-child execution behavior, `EXECUTE TASK ... AWAIT`,
+`SYSTEM$TASK_RUNTIME_INFO`, and task history were checked against Snowflake's
+[CREATE TASK](https://docs.snowflake.com/en/sql-reference/sql/create-task),
+[task graph](https://docs.snowflake.com/en/user-guide/tasks-graphs),
+[EXECUTE TASK](https://docs.snowflake.com/en/sql-reference/sql/execute-task),
+[SYSTEM$TASK_RUNTIME_INFO](https://docs.snowflake.com/en/sql-reference/functions/system_task_runtime_info),
+and [TASK_HISTORY](https://docs.snowflake.com/en/sql-reference/functions/task_history)
+documentation.
 
 ## Phase 2 infrastructure reference (already provisioned)
 
 The remaining sections describe the earlier infrastructure setup for
-reference only. They are not steps in the Phase 3 manual COPY workflow above.
+reference only. They are not steps in the Phase 3 task graph deployment above.
 
 DCM Project object definitions belong under `sources/definitions/`; Snowflake
 CLI does not upload SQL files from this directory. Phase 2 keeps the database,
