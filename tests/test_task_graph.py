@@ -40,11 +40,19 @@ def test_task_graph_has_three_fully_qualified_tasks_in_dependency_order() -> Non
     )
 
 
-def test_deployment_leaves_the_graph_suspended_and_without_a_schedule() -> None:
+def test_deployment_resumes_children_before_root_without_a_schedule() -> None:
     assert DEPLOYMENT.count("CREATE OR REPLACE TASK") == 3
     assert "SCHEDULE =" not in DEPLOYMENT.upper()
-    assert "ALTER TASK" not in DEPLOYMENT.upper()
-    assert "RESUME" not in DEPLOYMENT.upper()
+    resume_statements = re.findall(
+        r"ALTER TASK (SKYPOINTS_DB\.RAW\.\w+) RESUME;",
+        DEPLOYMENT,
+        flags=re.IGNORECASE,
+    )
+    assert resume_statements == [
+        "SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION",
+        "SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION",
+        "SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION",
+    ]
 
 
 def test_create_task_clauses_follow_snowflake_syntax_order() -> None:
@@ -118,11 +126,13 @@ def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
 
 def test_copy_result_scan_extracts_columns_without_case_sensitive_identifiers() -> None:
     assert DEPLOYMENT.count(
-        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER"
+        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'rows_loaded')::NUMBER"
     ) == 2
     assert DEPLOYMENT.count(
-        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR"
-    ) == 2
+        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'file')"
+    ) == 4
+    assert DEPLOYMENT.count("ARRAY_AGG(DISTINCT CASE") == 2
+    assert " FILTER (WHERE " not in DEPLOYMENT.upper()
     assert 'SUM("rows_loaded")' not in DEPLOYMENT
     assert '"file"' not in DEPLOYMENT
 
@@ -190,20 +200,9 @@ def test_audit_and_validation_capture_counts_sources_and_critical_nulls() -> Non
 
 def test_execution_and_monitoring_scripts_cover_manual_operation() -> None:
     assert (
-        "ALTER TASK SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION RESUME"
-        in EXECUTION
-    )
-    assert (
-        "ALTER TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION RESUME"
-        in EXECUTION
-    )
-    assert (
         "EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT"
         in EXECUTION
     )
-    assert (
-        "ALTER TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION RESUME"
-        not in EXECUTION
-    )
+    assert "ALTER TASK" not in EXECUTION.upper()
     assert "TASK_HISTORY(" in MONITORING
     assert "SKYPOINTS_DB.AUDIT.INGESTION_AUDIT" in MONITORING

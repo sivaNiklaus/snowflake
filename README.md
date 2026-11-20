@@ -27,7 +27,7 @@ Redemption JSON -> REDEMPTION_S3_STAGE -> TASK_REDEMPTION_INGESTION -> REDEMPTIO
                                TASK_INGESTION_VALIDATION
 ```
 
-Phase 3 uses a suspended-by-default Snowflake task graph to run the existing
+Phase 3 uses a manually triggered Snowflake task graph to run the existing
 `COPY INTO` logic and validate both raw tables. The member copy stores each
 complete source line in `SOURCE_RECORD`; the redemption copy stores each JSON
 document in `PAYLOAD`. It does not parse or transform either feed.
@@ -183,9 +183,10 @@ snow sql --connection <connection_name> --filename sql/orchestration/deploy_inge
 Deployment creates an audit table, SQL stored procedures, and three tasks in
 sequence: member ingestion (root), redemption ingestion after member success,
 and validation after redemption success. Each task uses `SKYPOINTS_ETL_WH`.
-Deployment does not resume tasks or define a schedule. Task creation is
-separate from DCM-managed infrastructure; it does not alter Phase 1/2
-definitions or recreate stages, formats, or raw tables.
+Deployment resumes the task graph in child-to-root order but does not define a
+schedule or execute the graph. Task creation is separate from DCM-managed
+infrastructure; it does not alter Phase 1/2 definitions or recreate stages,
+formats, or raw tables.
 
 For manual execution, run:
 
@@ -193,7 +194,7 @@ For manual execution, run:
 snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_task_graph.sql
 ```
 
-That script resumes only the child tasks and triggers the suspended root with:
+That script manually triggers the root task with:
 
 ```sql
 EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT;

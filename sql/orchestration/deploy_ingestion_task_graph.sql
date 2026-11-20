@@ -71,17 +71,18 @@ BEGIN
 
     SELECT
         COALESCE(
-            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER),
+            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'rows_loaded')::NUMBER),
             0
         ),
         COALESCE(
-            ARRAY_AGG(
-                DISTINCT GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR
-            ),
+            ARRAY_AGG(DISTINCT CASE
+                WHEN GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'file') IS NOT NULL
+                THEN GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'file')::VARCHAR
+            END),
             ARRAY_CONSTRUCT()
         )
       INTO :v_rows_loaded, :v_source_files
-      FROM TABLE(RESULT_SCAN(:v_copy_query_id)) AS copy_result;
+      FROM TABLE(RESULT_SCAN(:v_copy_query_id));
 
     UPDATE SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(),
@@ -168,17 +169,18 @@ BEGIN
 
     SELECT
         COALESCE(
-            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER),
+            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'rows_loaded')::NUMBER),
             0
         ),
         COALESCE(
-            ARRAY_AGG(
-                DISTINCT GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR
-            ),
+            ARRAY_AGG(DISTINCT CASE
+                WHEN GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'file') IS NOT NULL
+                THEN GET_IGNORE_CASE(OBJECT_CONSTRUCT(*), 'file')::VARCHAR
+            END),
             ARRAY_CONSTRUCT()
         )
       INTO :v_rows_loaded, :v_source_files
-      FROM TABLE(RESULT_SCAN(:v_copy_query_id)) AS copy_result;
+      FROM TABLE(RESULT_SCAN(:v_copy_query_id));
 
     UPDATE SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(),
@@ -364,3 +366,9 @@ CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION
     AFTER SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION
 AS
     CALL SKYPOINTS_DB.RAW.SP_RUN_INGESTION_VALIDATION();
+
+-- Resume graph children before the root. The root has no schedule and is
+-- still triggered manually with EXECUTE TASK.
+ALTER TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION RESUME;
+ALTER TASK SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION RESUME;
+ALTER TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION RESUME;
