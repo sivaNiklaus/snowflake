@@ -1,10 +1,9 @@
 # SkyPoints ETL
 
-SkyPoints ETL is a Snowflake-based data platform foundation for loyalty-member
-profiles and partner-airline redemption transactions. This repository is
-currently **Phase 1: Project Foundation**. It contains project scaffolding and
-initial Snowflake infrastructure definitions; it does not ingest or transform
-data.
+SkyPoints ETL is a Snowflake-based data platform for loyalty-member profiles
+and partner-airline redemption transactions. It contains **Phase 1: Project
+Foundation** and **Phase 2: Raw S3-to-Snowflake ingestion**. It does not perform
+business validation or transformations.
 
 ## Business problem
 
@@ -18,19 +17,19 @@ code.
 ## Architecture overview
 
 ```text
-Partner profile files ─┐
-                       ├─> AWS S3 (future) ─> Snowflake RAW
-Redemption JSON ───────┘                       │
+Partner profile files ─> S3 members/ ─> S3 event ─> Snowflake-managed SQS ─┐
+                                                                          ├─> Snowpipe ─> RAW
+Redemption JSON ───────> S3 redemptions/ ─> S3 event ─> Snowflake-managed SQS ┘
                                                v
                                    STAGING -> CORE -> ANALYTICS
                                                │
                                   AUDIT / operational history
 ```
 
-The diagram describes the target direction, not implemented services. Phase 1
-defines the Snowflake database, schemas, and a small auto-suspending warehouse.
-S3 resources, ingestion, data quality rules, transformations, and country
-outputs are future work.
+Phase 1 defines the Snowflake database, schemas, and a small auto-suspending
+warehouse. Phase 2 defines raw tables, file formats, external stages, and
+Snowpipe auto-ingest pipes. AWS bucket notifications and IAM trust are
+environment-specific setup steps documented in `sql/README.md`.
 
 ## Technology stack
 
@@ -38,7 +37,7 @@ outputs are future work.
 - **Snowflake CLI DCM Projects** for declarative Snowflake object definitions.
   The DCM manifest and definition layout follows the current format
   (`manifest_version: 2`); it was checked with Snowflake CLI 3.34.0.
-- **AWS S3** as a future source landing zone.
+- **AWS S3** as the member and redemption source landing zone.
 - **Python** for future utilities and tests.
 - **GitHub** and **GitHub Actions** for source control and foundational CI.
 
@@ -53,16 +52,19 @@ outputs are future work.
 │   └── README.md
 ├── sql/
 │   ├── README.md
-│   └── bootstrap_dcm.sql
+│   ├── bootstrap_dcm.sql
+│   └── create_s3_storage_integration.sql
 ├── sources/
 │   └── definitions/
-│       └── 01_foundation.sql
+│       ├── 01_foundation.sql
+│       └── 02_raw_ingestion.sql
 ├── src/
 │   ├── ingestion/
 │   ├── transformations/
 │   └── validations/
 ├── tests/
-│   └── test_project_foundation.py
+│   ├── test_project_foundation.py
+│   └── test_raw_ingestion.py
 ├── .env.example
 ├── .gitignore
 ├── manifest.yml
@@ -106,9 +108,10 @@ DCM Projects require Snowflake CLI 3.24.0 or later. This project's manifest
 format was verified against CLI 3.34.0 and Snowflake's official DCM project
 documentation. Configure a named Snowflake CLI connection using the
 [Snowflake CLI connection guide](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/connect).
-Do not put credentials in this repository. `.env.example` lists configuration
-names only; Snowflake CLI connection profiles and your organization's approved
-secret manager are responsible for authentication.
+Do not put credentials in this repository. `.env.example` contains a blank
+bucket setting and default prefixes only; set the bucket and prefixes in the
+SQL templates before deployment. Snowflake CLI connection profiles and your
+organization's approved secret manager are responsible for authentication.
 
 ### First-time DCM setup
 
@@ -133,30 +136,28 @@ snow dcm deploy --from . --target DEV --connection <connection_name>
 
 The `plan` and `deploy` commands require a working Snowflake account connection
 and appropriate privileges. DCM deployment can alter or drop objects managed
-by the project, so inspect the plan before deploying. The bootstrap SQL creates
-only the database and `AUDIT` schema required to host the DCM project; DCM then
-manages the declared database, five project schemas, and warehouse. Snowflake
-also creates a default `PUBLIC` schema with a database; it is not managed by
-this project's definitions.
+by the project, so inspect the plan before deploying. The bootstrap SQL
+creates only the database and `AUDIT` schema required to host the DCM project;
+DCM then manages the declared database, five project schemas, warehouse, and
+Phase 2 raw-ingestion objects. Snowflake also creates a default `PUBLIC`
+schema with a database; it is not managed by this project's definitions.
 
 ## Deployment strategy
 
-Phase 1 intentionally does **not** deploy from GitHub Actions. CI checks the
-Python test suite only. For Snowflake, use the Snowflake CLI DCM lifecycle:
-configure a connection, bootstrap the DCM host schema, create the DCM project,
-run `snow dcm plan`, review the changeset, and explicitly run
-`snow dcm deploy`. A later phase can add account-authenticated deployment after
-the target environments, role model, and CI secret management are agreed.
-
-AWS ingestion is also intentionally not configured: no buckets, IAM roles,
-Snowflake storage integrations, or credentials are provisioned in this phase.
+Deployment still uses the Snowflake CLI DCM lifecycle: configure a connection,
+bootstrap the DCM host schema, create the DCM project, run `snow dcm plan`,
+review the changeset, and explicitly run `snow dcm deploy`. The S3 storage
+integration is account-level and must be created separately with the
+administrator-run `sql/create_s3_storage_integration.sql` script before DCM
+deployment. AWS buckets, IAM roles, and event notifications are not provisioned
+by this repository. No credentials are stored here.
 
 ## Future implementation phases
 
-1. **Foundation (current):** repository, tests, DCM project configuration, and
-   initial Snowflake objects.
-2. **Source ingestion:** S3 landing conventions and ingestion for pipe-delimited
-   member files and partner redemption JSON.
+1. **Foundation:** repository, tests, DCM project configuration, and initial
+   Snowflake objects.
+2. **Raw source ingestion (current):** independent Snowpipe auto-ingest for
+   pipe-delimited member files and partner redemption JSON.
 3. **Validation and audit:** schema, quality, reject, and operational auditing
    rules.
 4. **Member and transaction processing:** deduplication, history, and country
@@ -174,9 +175,9 @@ snow --version
 snow dcm plan --from . --target DEV --connection <connection_name>
 ```
 
-The first two commands validate the local foundation. The Snowflake `plan`
-command requires a configured Snowflake account and the target placeholders
-must be replaced first; it has not been run as part of this phase.
+The Python tests validate the local definitions. The Snowflake `plan` command
+requires a configured account, the account-level integration, and replacement
+of all S3/IAM placeholders; it has not been run as part of this phase.
 
 ## Assumptions and limitations
 
@@ -189,8 +190,13 @@ must be replaced first; it has not been run as part of this phase.
 - The `DEV` manifest target is a template, not a usable account configuration.
   The account identifier, project owner role, and project object must be
   verified and replaced by the account administrator.
-- No AWS resources, authentication credentials, ingestion logic, Snowpipe,
-  Streams, Tasks, or ETL transformations are included in Phase 1.
+- AWS resources and credentials are not provisioned by this repository.
+  Storage integration, bucket event notifications, and actual Snowflake
+  deployment require account-specific setup and have not been run here.
+- Member source columns are intentionally positional VARCHARs. Header/data
+  interpretation and all business transformations remain future work.
+- Each redemption top-level JSON document is retained intact in a VARIANT;
+  nested arrays are not flattened.
 - Snowflake syntax and DCM project structure were checked against Snowflake's
   current documentation and the official CLI template. Account-specific DCM
   planning and deployment remain unverified until connected to a real account.

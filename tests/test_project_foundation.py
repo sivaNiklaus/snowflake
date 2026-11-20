@@ -42,11 +42,16 @@ def test_dcm_bootstrap_only_creates_project_host_schema() -> None:
     assert "CREATE WAREHOUSE" not in bootstrap.upper()
 
 
-def test_environment_example_contains_names_without_values() -> None:
+def test_environment_example_contains_credentials_as_blank_and_default_prefixes() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assignments = [
-        line for line in example.splitlines() if line and not line.startswith("#")
-    ]
+    assignments = {
+        key: value
+        for line in example.splitlines()
+        if line and not line.startswith("#")
+        for key, value in [line.split("=", maxsplit=1)]
+    }
 
-    assert assignments
-    assert all(re.fullmatch(r"[A-Z][A-Z0-9_]*=", line) for line in assignments)
+    assert all(re.fullmatch(r"[A-Z][A-Z0-9_]*", key) for key in assignments)
+    assert assignments["AWS_S3_BUCKET"] == ""
+    assert assignments["AWS_S3_MEMBERS_PREFIX"] == "members/"
+    assert assignments["AWS_S3_REDEMPTIONS_PREFIX"] == "redemptions/"
