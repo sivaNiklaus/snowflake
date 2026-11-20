@@ -70,10 +70,18 @@ BEGIN
     v_copy_query_id := SQLID;
 
     SELECT
-        COALESCE(SUM("rows_loaded"), 0),
-        COALESCE(ARRAY_AGG(DISTINCT "file"), ARRAY_CONSTRUCT())
+        COALESCE(
+            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER),
+            0
+        ),
+        COALESCE(
+            ARRAY_AGG(
+                DISTINCT GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR
+            ),
+            ARRAY_CONSTRUCT()
+        )
       INTO :v_rows_loaded, :v_source_files
-      FROM TABLE(RESULT_SCAN(:v_copy_query_id));
+      FROM TABLE(RESULT_SCAN(:v_copy_query_id)) AS copy_result;
 
     UPDATE SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(),
@@ -159,10 +167,18 @@ BEGIN
     v_copy_query_id := SQLID;
 
     SELECT
-        COALESCE(SUM("rows_loaded"), 0),
-        COALESCE(ARRAY_AGG(DISTINCT "file"), ARRAY_CONSTRUCT())
+        COALESCE(
+            SUM(GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER),
+            0
+        ),
+        COALESCE(
+            ARRAY_AGG(
+                DISTINCT GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR
+            ),
+            ARRAY_CONSTRUCT()
+        )
       INTO :v_rows_loaded, :v_source_files
-      FROM TABLE(RESULT_SCAN(:v_copy_query_id));
+      FROM TABLE(RESULT_SCAN(:v_copy_query_id)) AS copy_result;
 
     UPDATE SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(),

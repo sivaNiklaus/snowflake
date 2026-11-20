@@ -113,9 +113,18 @@ def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
     ) == 3
     assert DEPLOYMENT.count("v_copy_query_id := SQLID;") == 2
     assert "v_copy_query_id := LAST_QUERY_ID();" not in DEPLOYMENT
-    assert DEPLOYMENT.count('SUM("rows_loaded")') == 2
-    assert DEPLOYMENT.count('ARRAY_AGG(DISTINCT "file")') == 2
     assert DEPLOYMENT.count("RESULT_SCAN(:v_copy_query_id)") == 2
+
+
+def test_copy_result_scan_extracts_columns_without_case_sensitive_identifiers() -> None:
+    assert DEPLOYMENT.count(
+        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'rows_loaded')::NUMBER"
+    ) == 2
+    assert DEPLOYMENT.count(
+        "GET_IGNORE_CASE(OBJECT_CONSTRUCT(copy_result.*), 'file')::VARCHAR"
+    ) == 2
+    assert 'SUM("rows_loaded")' not in DEPLOYMENT
+    assert '"file"' not in DEPLOYMENT
 
 
 def test_audit_inserts_use_select_for_scripting_bind_variables() -> None:
