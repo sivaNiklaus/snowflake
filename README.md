@@ -17,19 +17,21 @@ code.
 ## Architecture overview
 
 ```text
-Partner profile files ─> S3 members/ ─> S3 event ─> Snowflake-managed SQS ─┐
-                                                                          ├─> Snowpipe ─> RAW
-Redemption JSON ───────> S3 redemptions/ ─> S3 event ─> Snowflake-managed SQS ┘
-                                               v
-                                   STAGING -> CORE -> ANALYTICS
-                                               │
-                                  AUDIT / operational history
+Member files ─> S3 members/ ───────┐
+                                   ├─> S3 events -> Snowflake-managed SQS queue(s)
+Redemption JSON -> S3 redemptions/ ┘                       │
+                                        ┌──────────────────┴─────────────────┐
+                                  Member Profile Pipe                 Redemption Pipe
+                                        │                                     │
+                                MEMBER_PROFILE_RAW                     REDEMPTION_RAW
 ```
 
 Phase 1 defines the Snowflake database, schemas, and a small auto-suspending
-warehouse. Phase 2 defines raw tables, file formats, external stages, and
-Snowpipe auto-ingest pipes. AWS bucket notifications and IAM trust are
-environment-specific setup steps documented in `sql/README.md`.
+warehouse. Phase 2 uses DCM for file formats, raw tables, and external stages.
+The two `CREATE PIPE` statements are separate SQL deployments because DCM's
+`DEFINE PIPE` feature is Preview. Snowflake may reuse a notification queue for
+multiple pipes in the same AWS region. AWS bucket notifications and IAM trust
+are environment-specific setup steps documented in `sql/README.md`.
 
 ## Technology stack
 
@@ -53,7 +55,10 @@ environment-specific setup steps documented in `sql/README.md`.
 ├── sql/
 │   ├── README.md
 │   ├── bootstrap_dcm.sql
-│   └── create_s3_storage_integration.sql
+│   ├── create_s3_storage_integration.sql
+│   └── ingestion/
+│       ├── create_member_profile_pipe.sql
+│       └── create_redemption_pipe.sql
 ├── sources/
 │   └── definitions/
 │       ├── 01_foundation.sql
@@ -64,7 +69,10 @@ environment-specific setup steps documented in `sql/README.md`.
 │   └── validations/
 ├── tests/
 │   ├── test_project_foundation.py
-│   └── test_raw_ingestion.py
+│   ├── test_raw_ingestion.py
+│   └── fixtures/
+│       ├── members/member_sample.dat
+│       └── redemptions/redemption_sample.json
 ├── .env.example
 ├── .gitignore
 ├── manifest.yml
@@ -72,12 +80,11 @@ environment-specific setup steps documented in `sql/README.md`.
 └── requirements.txt
 ```
 
-DCM Projects require SQL object definitions under `sources/definitions/`;
-Snowflake CLI uploads files from `sources/`, not from the repository's `sql/`
-directory. Therefore the managed database, schemas, and warehouse are defined
-in `sources/definitions/01_foundation.sql`. The separate `sql/` folder holds
-the one-time SQL bootstrap needed to create the database and schema that will
-contain the DCM project object.
+DCM Projects require object definitions under `sources/definitions/`;
+Snowflake CLI uploads files from `sources/`, not from `sql/`. The DCM
+definitions contain the database, schemas, warehouse, file formats, raw
+tables, and external stages. One-time account setup and standalone pipe
+creation scripts remain under `sql/`.
 
 ## Local development setup
 
@@ -144,13 +151,30 @@ schema with a database; it is not managed by this project's definitions.
 
 ## Deployment strategy
 
-Deployment still uses the Snowflake CLI DCM lifecycle: configure a connection,
-bootstrap the DCM host schema, create the DCM project, run `snow dcm plan`,
-review the changeset, and explicitly run `snow dcm deploy`. The S3 storage
-integration is account-level and must be created separately with the
-administrator-run `sql/create_s3_storage_integration.sql` script before DCM
-deployment. AWS buckets, IAM roles, and event notifications are not provisioned
-by this repository. No credentials are stored here.
+Deploy in this order:
+
+1. Configure the S3 bucket and prefixes in the SQL templates. Create the
+   account-level storage integration using
+   `sql/create_s3_storage_integration.sql`, then use its `DESC INTEGRATION`
+   output to finish the AWS IAM trust relationship.
+2. Bootstrap the DCM host schema. Create the project, review `snow dcm plan`,
+   then run `snow dcm deploy`. This deploys the stages and their tables and
+   file formats.
+3. Create the pipes with the standalone scripts, after their DCM-managed
+   stages/tables exist:
+
+   ```powershell
+   snow sql --connection <connection_name> --filename sql/ingestion/create_member_profile_pipe.sql
+   snow sql --connection <connection_name> --filename sql/ingestion/create_redemption_pipe.sql
+   ```
+
+4. Inspect both pipes' `notification_channel` values and configure S3
+   `ObjectCreated` event notifications as described in `sql/README.md`.
+
+The DCM and standalone Snowflake steps require a configured account and
+appropriate privileges. AWS buckets, IAM roles, and event notifications are
+environment-specific and are not provisioned here. No credentials are stored
+in the repository.
 
 ## Future implementation phases
 
@@ -193,8 +217,10 @@ of all S3/IAM placeholders; it has not been run as part of this phase.
 - AWS resources and credentials are not provisioned by this repository.
   Storage integration, bucket event notifications, and actual Snowflake
   deployment require account-specific setup and have not been run here.
-- Member source columns are intentionally positional VARCHARs. Header/data
-  interpretation and all business transformations remain future work.
+- Each member source line, including its leading delimiter, is retained
+  verbatim in `SOURCE_RECORD`; the source is not parsed into columns.
+- Header/data interpretation and all business transformations remain future
+  work.
 - Each redemption top-level JSON document is retained intact in a VARIANT;
   nested arrays are not flattened.
 - Snowflake syntax and DCM project structure were checked against Snowflake's
