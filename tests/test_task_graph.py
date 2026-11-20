@@ -117,6 +117,23 @@ def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
     assert DEPLOYMENT.count("RESULT_SCAN(:v_copy_query_id)") == 2
 
 
+def test_audit_inserts_use_select_for_scripting_bind_variables() -> None:
+    insert_modes = re.findall(
+        r"INSERT INTO SKYPOINTS_DB\.AUDIT\.INGESTION_AUDIT\s*"
+        r"\([^)]*\)\s*(SELECT|VALUES)\b",
+        DEPLOYMENT,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert insert_modes == ["SELECT", "SELECT", "SELECT"]
+    assert "PARSE_JSON(" not in DEPLOYMENT.upper()
+    assert not re.search(
+        r"INSERT\s+INTO\b.*?\bVALUES\s*\(",
+        DEPLOYMENT,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert DEPLOYMENT.count(":v_source_files;") == 2
+
+
 def test_validation_fails_for_empty_member_table() -> None:
     assert "v_member_row_count = 0" in VALIDATION_PROCEDURE
     assert "member_row_count=" in VALIDATION_PROCEDURE

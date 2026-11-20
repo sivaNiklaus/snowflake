@@ -38,15 +38,13 @@ BEGIN
         ROWS_LOADED,
         SOURCE_FILES
     )
-    VALUES
-    (
+    SELECT
         :v_run_id,
         'TASK_MEMBER_INGESTION',
         :v_started_at,
         'RUNNING',
         0,
-        :v_source_files
-    );
+        :v_source_files;
 
     COPY INTO SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW
     (
@@ -129,15 +127,13 @@ BEGIN
         ROWS_LOADED,
         SOURCE_FILES
     )
-    VALUES
-    (
+    SELECT
         :v_run_id,
         'TASK_REDEMPTION_INGESTION',
         :v_started_at,
         'RUNNING',
         0,
-        :v_source_files
-    );
+        :v_source_files;
 
     COPY INTO SKYPOINTS_DB.RAW.REDEMPTION_RAW
     (
@@ -225,14 +221,12 @@ BEGIN
         STATUS,
         ROWS_LOADED
     )
-    VALUES
-    (
+    SELECT
         :v_run_id,
         'TASK_INGESTION_VALIDATION',
         :v_started_at,
         'RUNNING',
-        0
-    );
+        0;
 
     SELECT
         COUNT(*),
