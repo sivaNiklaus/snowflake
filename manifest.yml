@@ -4,7 +4,6 @@ default_target: DEV
 
 targets:
   DEV:
-    # Replace these account-specific placeholders before using Snowflake CLI.
-    account_identifier: YOUR_ORG-YOUR_ACCOUNT
+    account_identifier: GIMFDUR-DY25356
     project_name: SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV
-    project_owner: YOUR_DCM_PROJECT_OWNER_ROLE
+    project_owner: ACCOUNTADMIN
