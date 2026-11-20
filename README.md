@@ -183,10 +183,10 @@ snow sql --connection <connection_name> --filename sql/orchestration/deploy_inge
 Deployment creates an audit table, SQL stored procedures, and three tasks in
 sequence: member ingestion (root), redemption ingestion after member success,
 and validation after redemption success. Each task uses `SKYPOINTS_ETL_WH`.
-Deployment resumes the task graph in child-to-root order but does not define a
-schedule or execute the graph. Task creation is separate from DCM-managed
-infrastructure; it does not alter Phase 1/2 definitions or recreate stages,
-formats, or raw tables.
+Deployment resumes only the child tasks in dependency order. The root remains
+suspended because it has no schedule; deployment does not execute the graph.
+Task creation is separate from DCM-managed infrastructure; it does not alter
+Phase 1/2 definitions or recreate stages, formats, or raw tables.
 
 For manual execution, run:
 

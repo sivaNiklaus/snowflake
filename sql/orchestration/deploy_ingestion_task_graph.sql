@@ -367,8 +367,7 @@ CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION
 AS
     CALL SKYPOINTS_DB.RAW.SP_RUN_INGESTION_VALIDATION();
 
--- Resume graph children before the root. The root has no schedule and is
--- still triggered manually with EXECUTE TASK.
+-- Resume graph children in dependency order. Keep the root suspended because
+-- it has no schedule; EXECUTE TASK triggers it manually.
 ALTER TASK SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION RESUME;
 ALTER TASK SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION RESUME;
-ALTER TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION RESUME;

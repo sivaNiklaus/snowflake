@@ -40,7 +40,7 @@ def test_task_graph_has_three_fully_qualified_tasks_in_dependency_order() -> Non
     )
 
 
-def test_deployment_resumes_children_before_root_without_a_schedule() -> None:
+def test_deployment_resumes_children_and_keeps_root_suspended() -> None:
     assert DEPLOYMENT.count("CREATE OR REPLACE TASK") == 3
     assert "SCHEDULE =" not in DEPLOYMENT.upper()
     resume_statements = re.findall(
@@ -51,8 +51,11 @@ def test_deployment_resumes_children_before_root_without_a_schedule() -> None:
     assert resume_statements == [
         "SKYPOINTS_DB.RAW.TASK_INGESTION_VALIDATION",
         "SKYPOINTS_DB.RAW.TASK_REDEMPTION_INGESTION",
-        "SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION",
     ]
+    assert (
+        "ALTER TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION RESUME"
+        not in DEPLOYMENT
+    )
 
 
 def test_create_task_clauses_follow_snowflake_syntax_order() -> None:

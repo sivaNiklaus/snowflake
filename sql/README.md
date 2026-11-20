@@ -30,9 +30,9 @@ the warehouse and the global `EXECUTE TASK` privilege. The procedures execute
 as their owner, so that role also needs access to the existing stages and raw
 tables. Use the same owning role for all tasks in the graph.
 
-The deployment script is rerunnable, resumes the graph in child-to-root order,
-and does not define a schedule. Resuming the tasks does not execute the graph;
-the root remains manually triggered.
+The deployment script is rerunnable, resumes the child tasks in dependency
+order, and does not define a schedule. The root stays suspended because it has
+no schedule; `EXECUTE TASK` triggers it manually.
 The graph is:
 
 1. `TASK_MEMBER_INGESTION` is the root and copies the member feed.
@@ -54,8 +54,9 @@ After deploying the graph, execute:
 snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_task_graph.sql
 ```
 
-The deployment script resumes the children and root in dependency order. The
-execution script then runs the full graph synchronously using this single trigger:
+The deployment script resumes the child tasks in dependency order and leaves
+the root suspended. The execution script runs the full graph synchronously
+using this single trigger:
 
 ```sql
 EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT;
