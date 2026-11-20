@@ -1,12 +1,65 @@
 # Snowflake SQL deployment
 
+## Phase 3: manual raw ingestion
+
+Phase 3 reuses the already-deployed external stages, named file formats, and
+raw tables. It creates no Snowflake objects and does not run Snowpipe, Streams,
+or Tasks. The existing Phase 2 pipe scripts remain untouched; do not run them
+concurrently with this manual load workflow.
+
+| Feed | Stage | File format | Target |
+| --- | --- | --- | --- |
+| Members | `SKYPOINTS_DB.RAW.MEMBER_S3_STAGE` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_CSV` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW` |
+| Redemptions | `SKYPOINTS_DB.RAW.REDEMPTION_S3_STAGE` | `SKYPOINTS_DB.RAW.REDEMPTION_JSON` | `SKYPOINTS_DB.RAW.REDEMPTION_RAW` |
+
+Run the load scripts from the repository root with a Snowflake connection that
+can read the stages and insert into the raw tables:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/ingestion/load_member_profile.sql
+snow sql --connection <connection_name> --filename sql/ingestion/load_redemption.sql
+```
+
+The two feeds are independent; either can run first. The member script copies
+only `$1::VARCHAR` into `SOURCE_RECORD`, preserving complete lines, delimiters,
+and optional fields. The redemption script copies `$1::VARIANT` into `PAYLOAD`
+without flattening. Both populate filename, row number, content key, and
+ingestion timestamp metadata.
+
+Both statements use `ON_ERROR = 'ABORT_STATEMENT'` and omit `FORCE`.
+Snowflake's normal per-table load metadata skips files already loaded, making
+reruns safe within its load-history retention. Check COPY history before any
+intentional reprocessing or backfill.
+
+After both loads, run the matching validation scripts:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/ingestion/validate_member_profile.sql
+snow sql --connection <connection_name> --filename sql/ingestion/validate_redemption.sql
+```
+
+Expected results: counts include newly loaded files; member samples retain the
+complete source line; redemption samples remain complete `VARIANT` documents.
+Null checks should show no missing records or required metadata. Filename/time
+checks should show source files and populated ingestion timestamps. COPY
+history should report loaded files; a rerun can show `Load skipped`.
+
+Run local SQL-shape and fixture checks with `python -m pytest`. These tests do
+not connect to or deploy against Snowflake. Confirm no existing auto-ingest
+pipe is concurrently consuming the same prefixes before using manual COPY.
+
+## Phase 2 infrastructure reference (already provisioned)
+
+The remaining sections describe the earlier infrastructure setup for
+reference only. They are not steps in the Phase 3 manual COPY workflow above.
+
 DCM Project object definitions belong under `sources/definitions/`; Snowflake
 CLI does not upload SQL files from this directory. Phase 2 keeps the database,
 schemas, warehouse, file formats, raw tables, and external stages in DCM.
 Snowflake's DCM `DEFINE PIPE` feature is Preview, so the two pipes are created
 separately with conventional `CREATE PIPE` statements under `sql/ingestion/`.
 
-## Deployment order
+### Existing Phase 2 deployment order
 
 Deploy these steps in order:
 
@@ -78,7 +131,7 @@ Deploy these steps in order:
    rules for the same event types. Check existing bucket notifications too:
    prefixes such as `members/` and `members/archive/` overlap.
 
-## Raw member record preservation
+### Phase 2 raw member record preservation
 
 The assessment's formal member specification includes `Post_Code`, while the
 supplied flat-file sample does not. The member CSV file format therefore uses
@@ -99,7 +152,7 @@ Redemption files use a JSON file format with `STRIP_OUTER_ARRAY = FALSE`.
 Each top-level JSON document is copied intact to `PAYLOAD` (`VARIANT`), so
 nested redemption arrays—including empty arrays—are not flattened.
 
-## Local and account smoke tests
+### Phase 2 local and account smoke tests
 
 Run the local fixture and definition checks before deploying:
 
@@ -129,7 +182,7 @@ ORDER BY INGESTED_AT, SOURCE_ROW_NUMBER;
 These queries should show the `H` and `D` member lines unchanged, and each
 redemption document as one `VARIANT` value.
 
-## Monitoring
+### Phase 2 pipe monitoring
 
 Check each pipe's current execution state, pending files, and notification
 queue:

@@ -1,9 +1,10 @@
 # SkyPoints ETL
 
 SkyPoints ETL is a Snowflake-based data platform for loyalty-member profiles
-and partner-airline redemption transactions. It contains **Phase 1: Project
-Foundation** and **Phase 2: Raw S3-to-Snowflake ingestion**. It does not perform
-business validation or transformations.
+and partner-airline redemption transactions. It contains the Phase 1
+foundation, Phase 2 S3/Snowflake access infrastructure, and the current
+**Phase 3: Raw Data Ingestion** scripts. It does not perform business
+validation or transformations.
 
 ## Business problem
 
@@ -17,21 +18,14 @@ code.
 ## Architecture overview
 
 ```text
-Member files ─> S3 members/ ───────┐
-                                   ├─> S3 events -> Snowflake-managed SQS queue(s)
-Redemption JSON -> S3 redemptions/ ┘                       │
-                                        ┌──────────────────┴─────────────────┐
-                                  Member Profile Pipe                 Redemption Pipe
-                                        │                                     │
-                                MEMBER_PROFILE_RAW                     REDEMPTION_RAW
+Member files ─────> existing MEMBER_S3_STAGE ──> COPY INTO ──> MEMBER_PROFILE_RAW
+Redemption JSON ──> existing REDEMPTION_S3_STAGE -> COPY INTO -> REDEMPTION_RAW
 ```
 
-Phase 1 defines the Snowflake database, schemas, and a small auto-suspending
-warehouse. Phase 2 uses DCM for file formats, raw tables, and external stages.
-The two `CREATE PIPE` statements are separate SQL deployments because DCM's
-`DEFINE PIPE` feature is Preview. Snowflake may reuse a notification queue for
-multiple pipes in the same AWS region. AWS bucket notifications and IAM trust
-are environment-specific setup steps documented in `sql/README.md`.
+Phase 3 runs explicit, repeatable `COPY INTO` statements against the existing
+stages and raw tables. It does not create Snowflake objects or introduce
+Snowpipe, Streams, or Tasks. The member copy stores each complete source line
+in `SOURCE_RECORD`; the redemption copy stores each JSON document in `PAYLOAD`.
 
 ## Technology stack
 
@@ -58,7 +52,11 @@ are environment-specific setup steps documented in `sql/README.md`.
 │   ├── create_s3_storage_integration.sql
 │   └── ingestion/
 │       ├── create_member_profile_pipe.sql
-│       └── create_redemption_pipe.sql
+│       ├── create_redemption_pipe.sql
+│       ├── load_member_profile.sql
+│       ├── load_redemption.sql
+│       ├── validate_member_profile.sql
+│       └── validate_redemption.sql
 ├── sources/
 │   └── definitions/
 │       ├── 01_foundation.sql
@@ -69,6 +67,7 @@ are environment-specific setup steps documented in `sql/README.md`.
 │   └── validations/
 ├── tests/
 │   ├── test_project_foundation.py
+│   ├── test_copy_ingestion.py
 │   ├── test_raw_ingestion.py
 │   └── fixtures/
 │       ├── members/member_sample.dat
@@ -82,9 +81,9 @@ are environment-specific setup steps documented in `sql/README.md`.
 
 DCM Projects require object definitions under `sources/definitions/`;
 Snowflake CLI uploads files from `sources/`, not from `sql/`. The DCM
-definitions contain the database, schemas, warehouse, file formats, raw
-tables, and external stages. One-time account setup and standalone pipe
-creation scripts remain under `sql/`.
+definitions contain the existing database, schemas, warehouse, file formats,
+raw tables, and external stages. Phase 3's manual load and validation scripts
+are standalone SQL under `sql/ingestion/`; they do not recreate those objects.
 
 ## Local development setup
 
@@ -149,45 +148,44 @@ DCM then manages the declared database, five project schemas, warehouse, and
 Phase 2 raw-ingestion objects. Snowflake also creates a default `PUBLIC`
 schema with a database; it is not managed by this project's definitions.
 
-## Deployment strategy
+## Existing infrastructure deployment
 
-Deploy in this order:
+The Phase 1/2 infrastructure setup is documented in [sql/README.md](sql/README.md).
+Do not rerun it as part of Phase 3. In particular, Phase 3 does not execute
+the existing pipe creation scripts.
 
-1. Configure the S3 bucket and prefixes in the SQL templates. Create the
-   account-level storage integration using
-   `sql/create_s3_storage_integration.sql`, then use its `DESC INTEGRATION`
-   output to finish the AWS IAM trust relationship.
-2. Bootstrap the DCM host schema. Create the project, review `snow dcm plan`,
-   then run `snow dcm deploy`. This deploys the stages and their tables and
-   file formats.
-3. Create the pipes with the standalone scripts, after their DCM-managed
-   stages/tables exist:
+## Phase 3 execution
 
-   ```powershell
-   snow sql --connection <connection_name> --filename sql/ingestion/create_member_profile_pipe.sql
-   snow sql --connection <connection_name> --filename sql/ingestion/create_redemption_pipe.sql
-   ```
+With the existing stages and raw tables available, run each manual load once
+per batch (either order is fine):
 
-4. Inspect both pipes' `notification_channel` values and configure S3
-   `ObjectCreated` event notifications as described in `sql/README.md`.
+```powershell
+snow sql --connection <connection_name> --filename sql/ingestion/load_member_profile.sql
+snow sql --connection <connection_name> --filename sql/ingestion/load_redemption.sql
+```
 
-The DCM and standalone Snowflake steps require a configured account and
-appropriate privileges. AWS buckets, IAM roles, and event notifications are
-environment-specific and are not provisioned here. No credentials are stored
-in the repository.
+Then run the corresponding validation scripts as described in
+`sql/README.md`. The COPY statements use Snowflake's normal per-table load
+history and do not set `FORCE`; repeating a load skips files already recorded
+as loaded. If Phase 2 pipes are active for the same prefixes, coordinate or
+pause them before manual loading to avoid concurrent ingestion.
+
+No Phase 1/2 infrastructure changes or live Snowflake deployment are part of
+this phase.
 
 ## Future implementation phases
 
 1. **Foundation:** repository, tests, DCM project configuration, and initial
    Snowflake objects.
-2. **Raw source ingestion (current):** independent Snowpipe auto-ingest for
-   pipe-delimited member files and partner redemption JSON.
-3. **Validation and audit:** schema, quality, reject, and operational auditing
+2. **S3/Snowflake access infrastructure:** configured source landing and
+   external stages.
+3. **Raw data ingestion (current):** manual staged-file `COPY INTO` loads.
+4. **Validation and audit:** schema, quality, reject, and operational auditing
    rules.
-4. **Member and transaction processing:** deduplication, history, and country
+5. **Member and transaction processing:** deduplication, history, and country
    migration handling.
-5. **Country-specific outputs:** curated tables and analytics interfaces.
-6. **Scale and operations:** workload tuning, observability, backfills, and
+6. **Country-specific outputs:** curated tables and analytics interfaces.
+7. **Scale and operations:** workload tuning, observability, backfills, and
    carefully gated automated deployments.
 
 ## Validation commands
@@ -195,13 +193,13 @@ in the repository.
 ```powershell
 python -m pip install -r requirements.txt
 python -m pytest
-snow --version
-snow dcm plan --from . --target DEV --connection <connection_name>
+snow sql --connection <connection_name> --filename sql/ingestion/validate_member_profile.sql
+snow sql --connection <connection_name> --filename sql/ingestion/validate_redemption.sql
 ```
 
-The Python tests validate the local definitions. The Snowflake `plan` command
-requires a configured account, the account-level integration, and replacement
-of all S3/IAM placeholders; it has not been run as part of this phase.
+Python tests validate the SQL shape and fixtures. The Snowflake scripts require
+a connection with access to the existing stages, file formats, and raw tables;
+they have not been run against an account as part of this phase.
 
 ## Assumptions and limitations
 
@@ -219,6 +217,9 @@ of all S3/IAM placeholders; it has not been run as part of this phase.
   deployment require account-specific setup and have not been run here.
 - Each member source line, including its leading delimiter, is retained
   verbatim in `SOURCE_RECORD`; the source is not parsed into columns.
+- Snowflake COPY load metadata provides same-table file de-duplication for
+  files recorded as loaded. Inspect COPY history before any intentional
+  backfill or reprocessing.
 - Header/data interpretation and all business transformations remain future
   work.
 - Each redemption top-level JSON document is retained intact in a VARIANT;
