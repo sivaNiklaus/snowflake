@@ -112,8 +112,8 @@ def test_ingestion_procedures_reuse_copy_logic_and_audit_failures() -> None:
         "SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')"
     ) == 3
     assert DEPLOYMENT.count("v_copy_query_id := LAST_QUERY_ID();") == 2
-    assert DEPLOYMENT.count("SUM(ROWS_LOADED)") == 2
-    assert DEPLOYMENT.count("ARRAY_AGG(DISTINCT FILE)") == 2
+    assert DEPLOYMENT.count('SUM("rows_loaded")') == 2
+    assert DEPLOYMENT.count('ARRAY_AGG(DISTINCT "file")') == 2
     assert DEPLOYMENT.count("RESULT_SCAN(:v_copy_query_id)") == 2
 
 

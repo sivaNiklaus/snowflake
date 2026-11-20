@@ -70,8 +70,8 @@ BEGIN
     v_copy_query_id := LAST_QUERY_ID();
 
     SELECT
-        COALESCE(SUM(ROWS_LOADED), 0),
-        COALESCE(ARRAY_AGG(DISTINCT FILE), ARRAY_CONSTRUCT())
+        COALESCE(SUM("rows_loaded"), 0),
+        COALESCE(ARRAY_AGG(DISTINCT "file"), ARRAY_CONSTRUCT())
       INTO :v_rows_loaded, :v_source_files
       FROM TABLE(RESULT_SCAN(:v_copy_query_id));
 
@@ -159,8 +159,8 @@ BEGIN
     v_copy_query_id := LAST_QUERY_ID();
 
     SELECT
-        COALESCE(SUM(ROWS_LOADED), 0),
-        COALESCE(ARRAY_AGG(DISTINCT FILE), ARRAY_CONSTRUCT())
+        COALESCE(SUM("rows_loaded"), 0),
+        COALESCE(ARRAY_AGG(DISTINCT "file"), ARRAY_CONSTRUCT())
       INTO :v_rows_loaded, :v_source_files
       FROM TABLE(RESULT_SCAN(:v_copy_query_id));
 
