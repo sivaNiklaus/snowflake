@@ -1,6 +1,6 @@
+
 -- Foundation only: no ingestion, orchestration, or transformation objects.
-DEFINE DATABASE SKYPOINTS_DB
-    COMMENT = 'SkyPoints ETL platform database';
+-- SKYPOINTS_DB already exists and is the parent of this DCM project.
 
 DEFINE SCHEMA SKYPOINTS_DB.RAW
     COMMENT = 'Unmodified source data landing zone';
