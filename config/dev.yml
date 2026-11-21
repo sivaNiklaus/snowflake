@@ -1,0 +1,11 @@
+# Documentation template only; not automatically loaded by Snowflake or CI.
+environment: dev
+snowflake:
+  database: SKYPOINTS_DB
+  warehouse: SKYPOINTS_ETL_WH
+  connection_name: "<configure local Snowflake CLI connection>"
+storage:
+  integration: SKYPOINTS_S3_STORAGE_INT
+  s3_bucket: "<configure>"
+  member_prefix: "members/"
+  redemption_prefix: "redemptions/"

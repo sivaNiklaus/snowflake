@@ -5,7 +5,8 @@ and partner-airline redemption transactions. It contains the Phase 1
 foundation, Phase 2 S3/Snowflake access infrastructure, Phase 3 raw ingestion,
 the combined **Phase 4-5: metadata-driven DQ and business processing** task
 graph, and **Phase 6A-6C: country routing, movement synchronization, and
-reconciliation**.
+reconciliation**, with **Phase 7B-7D: unified manual orchestration, recovery,
+and monitoring**.
 
 ## Business problem
 
@@ -37,14 +38,14 @@ valid data into core tables.
 ## Combined Phase 4-5 processing
 
 The ingestion, DQ, and business-transformation deployment in
-[`sql/processing/deploy_ingestion_dq_and_business_transformation.sql`](sql/processing/deploy_ingestion_dq_and_business_transformation.sql)
+[`sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql`](sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql)
 creates parsed staging, audit/DQ, quarantine, and core objects, plus SQL
 procedures and four downstream tasks. Deploy Phase 3 first, then Phase 4-5
 with the same task-owning role:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/deploy_ingestion_task_graph.sql
-snow sql --connection <connection_name> --filename sql/processing/deploy_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql
 ```
 
 The complete manually triggered graph is:
@@ -65,7 +66,7 @@ temporarily resumes descendants in dependency order, manually triggers the
 suspended root, waits for the full graph, then suspends descendants again:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/execute_ingestion_dq_and_business_transformation.sql
 ```
 
 ### Parsing and data quality
@@ -135,7 +136,7 @@ final processing step rechecks referential integrity against committed current
 members and records any unmatched transaction as a DQ failure before merging.
 
 Use
-[`sql/orchestration/monitor_ingestion_dq_and_business_transformation.sql`](sql/orchestration/monitor_ingestion_dq_and_business_transformation.sql)
+[`sql/03_processing/dq_and_transformation/monitor_ingestion_dq_and_business_transformation.sql`](sql/03_processing/dq_and_transformation/monitor_ingestion_dq_and_business_transformation.sql)
 for task history, procedure audits, DQ counts, rule outcomes, quarantine, and
 core referential-integrity queries. Monitoring and execution remain separate
 from deployment. Static tests do not deploy or execute SQL against Snowflake.
@@ -151,14 +152,14 @@ existing `STAGING.DQ_QUARANTINE` structure. The router does not change
 Deploy Phase 6A after Phase 3 and Phase 4-5:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/deploy_country_routing.sql
 ```
 
 Then deploy the movement audit, reconciliation procedure/audit, and suspended
 reconciliation task:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/processing/deploy_country_movement_reconciliation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql
 ```
 
 `AUDIT.COUNTRY_ROUTING_CONFIG` is seeded idempotently with exactly these
@@ -225,16 +226,16 @@ after `TASK_REDEMPTION_PROCESSING`. Both tasks use `SKYPOINTS_ETL_WH`, are
 created suspended, and have no schedule. Manually run the complete graph:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/execute_country_routing.sql
 ```
 
 The script resumes descendants in reverse dependency order, executes the
 controlled graph runner, and attempts cleanup after both success and failure.
 Deploy Phase 7 before using this compatibility entry point. For complete run
 history and task-level metrics, use
-[`sql/orchestration/monitor_unified_pipeline.sql`](sql/orchestration/monitor_unified_pipeline.sql).
+[`sql/04_unified_pipeline/monitor_unified_pipeline.sql`](sql/04_unified_pipeline/monitor_unified_pipeline.sql).
 Phase 6-specific monitoring queries remain in
-[`sql/orchestration/monitor_country_routing.sql`](sql/orchestration/monitor_country_routing.sql).
+[`sql/03_processing/country_routing/monitor_country_routing.sql`](sql/03_processing/country_routing/monitor_country_routing.sql).
 They report task history, config and table row-count metadata, routing and
 movement audit, reconciliation results, and quarantine reasons. To run
 reconciliation independently, call
@@ -254,17 +255,17 @@ and routing SQL failures remain visible.
 Phase 7 adds a single controlled entry point for the existing Phase 3-6C task
 graph. Deploy the scripts in this order, using the same task-owning role:
 
-1. `sql/orchestration/deploy_ingestion_task_graph.sql`
-2. `sql/processing/deploy_ingestion_dq_and_business_transformation.sql`
-3. `sql/processing/deploy_country_routing.sql`
-4. `sql/processing/deploy_country_movement_reconciliation.sql`
-5. `sql/orchestration/deploy_unified_pipeline.sql`
+1. `sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql`
+2. `sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql`
+3. `sql/03_processing/country_routing/deploy_country_routing.sql`
+4. `sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql`
+5. `sql/04_unified_pipeline/deploy_unified_pipeline.sql`
 
 Deployment leaves the root and descendants suspended and defines no schedule.
 To run the complete pipeline, call the controlled entry point:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/execute_unified_pipeline.sql
 ```
 
 `AUDIT.SP_RUN_COMPLETE_PIPELINE()` guards against overlapping managed runs,
@@ -301,7 +302,7 @@ from that run's rule results), lifetime quarantine totals, current core totals,
 country movement counts, reconciliation results, and failed-task details:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/monitor_unified_pipeline.sql
 ```
 
 These are not distributed transactions: each task and procedure commits its
@@ -331,47 +332,56 @@ static tests.
 │   └── workflows/
 │       └── ci.yml
 ├── config/
-│   └── README.md
+│   ├── README.md
+│   ├── dev.yml
+│   ├── staging.yml
+│   └── prod.yml
+├── docs/
+│   ├── architecture.md
+│   └── runbook.md
 ├── sql/
 │   ├── README.md
-│   ├── bootstrap_dcm.sql
-│   ├── create_s3_storage_integration.sql
-│   ├── ingestion/
-│   │   ├── create_member_profile_pipe.sql
-│   │   ├── create_redemption_pipe.sql
-│   │   ├── load_member_profile.sql
-│   │   ├── load_redemption.sql
-│   │   ├── validate_member_profile.sql
-│   │   └── validate_redemption.sql
-│   ├── processing/
-│   │   ├── deploy_ingestion_dq_and_business_transformation.sql
-│   │   └── deploy_country_routing.sql
-│   └── orchestration/
-│       ├── deploy_ingestion_task_graph.sql
-│       ├── execute_ingestion_task_graph.sql
-│       ├── execute_ingestion_dq_and_business_transformation.sql
-│       ├── execute_country_routing.sql
-│       ├── monitor_ingestion_task_graph.sql
-│       ├── monitor_ingestion_dq_and_business_transformation.sql
-│       └── monitor_country_routing.sql
+│   ├── 00_setup/
+│   │   ├── bootstrap_dcm.sql
+│   │   └── create_s3_storage_integration.sql
+│   ├── 01_ingestion/
+│   │   ├── pipes/
+│   │   │   ├── create_member_profile_pipe.sql
+│   │   │   └── create_redemption_pipe.sql
+│   │   ├── load/
+│   │   │   ├── load_member_profile.sql
+│   │   │   └── load_redemption.sql
+│   │   └── validate/
+│   │       ├── validate_member_profile.sql
+│   │       └── validate_redemption.sql
+│   ├── 02_orchestration_ingestion/
+│   │   ├── deploy_ingestion_task_graph.sql
+│   │   ├── execute_ingestion_task_graph.sql
+│   │   └── monitor_ingestion_task_graph.sql
+│   ├── 03_processing/
+│   │   ├── dq_and_transformation/
+│   │   │   ├── deploy_ingestion_dq_and_business_transformation.sql
+│   │   │   ├── execute_ingestion_dq_and_business_transformation.sql
+│   │   │   └── monitor_ingestion_dq_and_business_transformation.sql
+│   │   ├── country_routing/
+│   │   │   ├── deploy_country_routing.sql
+│   │   │   ├── execute_country_routing.sql
+│   │   │   └── monitor_country_routing.sql
+│   │   └── country_movement_reconciliation/
+│   │       └── deploy_country_movement_reconciliation.sql
+│   └── 04_unified_pipeline/
+│       ├── deploy_unified_pipeline.sql
+│       ├── execute_unified_pipeline.sql
+│       └── monitor_unified_pipeline.sql
 ├── sources/
 │   └── definitions/
 │       ├── 01_foundation.sql
 │       └── 02_raw_ingestion.sql
-├── src/
-│   ├── ingestion/
-│   ├── transformations/
-│   └── validations/
 ├── tests/
-│   ├── test_project_foundation.py
-│   ├── test_copy_ingestion.py
-│   ├── test_raw_ingestion.py
-│   ├── test_task_graph.py
-│   ├── test_phase45_static.py
-│   ├── test_phase6_country_routing.py
-│   └── fixtures/
-│       ├── members/member_sample.dat
-│       └── redemptions/redemption_sample.json
+│   ├── fixtures/
+│   │   ├── members/member_sample.dat
+│   │   └── redemptions/redemption_sample.json
+│   └── test_*.py
 ├── .env.example
 ├── .gitignore
 ├── manifest.yml
@@ -381,10 +391,14 @@ static tests.
 
 DCM Projects require object definitions under `sources/definitions/`;
 Snowflake CLI uploads files from `sources/`, not from `sql/`. The DCM
-definitions contain the existing database, schemas, warehouse, file formats,
-raw tables, and external stages. Phase 3 orchestration and the standalone
-load/validation scripts are separate SQL under `sql/`; they do not recreate
-those objects.
+definitions manage the project schemas, warehouse, file formats, raw tables,
+and external stages. The existing `SKYPOINTS_DB` database and parent `AUDIT`
+schema are intentionally outside DCM management. Phase task/procedure
+deployment and standalone load/validation scripts are separate SQL under the
+numbered `sql/` folders; they do not recreate DCM-managed objects.
+The YAML files in `config/` document environment-specific settings to supply;
+they are templates and are not automatically loaded by Snowflake or the CI
+workflow. The existing GitHub Actions workflow is test-only.
 
 ## Local development setup
 
@@ -435,7 +449,7 @@ owner has the required privileges. The DCM project object is located in
 authorized Snowflake CLI connection:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/bootstrap_dcm.sql
+snow sql --connection <connection_name> --filename sql/00_setup/bootstrap_dcm.sql
 ```
 
 Then create the DCM project, preview its planned changes, and deploy only after
@@ -451,9 +465,10 @@ The `plan` and `deploy` commands require a working Snowflake account connection
 and appropriate privileges. DCM deployment can alter or drop objects managed
 by the project, so inspect the plan before deploying. The bootstrap SQL
 creates only the database and `AUDIT` schema required to host the DCM project;
-DCM then manages the declared database, five project schemas, warehouse, and
-Phase 2 raw-ingestion objects. Snowflake also creates a default `PUBLIC`
-schema with a database; it is not managed by this project's definitions.
+the existing database and `AUDIT` parent schema remain outside DCM management.
+DCM manages the declared `RAW`, `STAGING`, `CORE`, and `ANALYTICS` schemas,
+warehouse, and Phase 2 raw-ingestion objects. Snowflake also creates a default
+`PUBLIC` schema with a database; it is not managed by this project's definitions.
 
 ## Existing infrastructure deployment
 
@@ -467,7 +482,7 @@ With the existing stages, formats, warehouse, and raw tables available,
 deploy the task graph:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/deploy_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql
 ```
 
 Deployment creates an audit table, SQL stored procedures, and three tasks in
@@ -481,7 +496,7 @@ Phase 1/2 definitions or recreate stages, formats, or raw tables.
 For Phase 3 standalone manual execution, run:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/execute_ingestion_task_graph.sql
 ```
 
 That script manually triggers the root task with:
@@ -494,7 +509,9 @@ This command waits for the Phase 3 graph. If Phase 4-5 has also been deployed,
 use `execute_ingestion_dq_and_business_transformation.sql` instead; it temporarily resumes the
 descendants and suspends them again after a successful run. No daily schedule
 is configured or in scope. Monitor task state and audit rows using
-`sql/orchestration/monitor_ingestion_task_graph.sql`.
+`sql/02_orchestration_ingestion/monitor_ingestion_task_graph.sql`. These
+Phase-specific scripts are useful for isolated operation; use the Phase 7
+unified entry point for the complete Phase 3-6C graph.
 Detailed deployment privileges, expected audit fields, failure recovery, and
 the Phase 1/2 account setup are documented in [sql/README.md](sql/README.md).
 For the complete Phase 3-5 graph, deploy and execute as described above.
@@ -529,7 +546,7 @@ execution is performed by the local static tests.
 ```powershell
 python -m pip install -r requirements.txt
 python -m pytest -q
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/monitor_unified_pipeline.sql
 ```
 
 Python tests validate static SQL shape and fixtures. The Snowflake scripts

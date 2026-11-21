@@ -5,23 +5,28 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORCHESTRATION = ROOT / "sql" / "orchestration"
-PROCESSING = ROOT / "sql" / "processing"
+ORCHESTRATION = ROOT / "sql" / "02_orchestration_ingestion"
+PROCESSING = ROOT / "sql" / "03_processing" / "dq_and_transformation"
+COUNTRY_ROUTING = ROOT / "sql" / "03_processing" / "country_routing"
+COUNTRY_RECONCILIATION = (
+    ROOT / "sql" / "03_processing" / "country_movement_reconciliation"
+)
+UNIFIED_PIPELINE = ROOT / "sql" / "04_unified_pipeline"
 TASK_DEPLOYMENT = (
     ORCHESTRATION / "deploy_ingestion_task_graph.sql"
 ).read_text(encoding="utf-8")
 PHASE45 = (
     PROCESSING / "deploy_ingestion_dq_and_business_transformation.sql"
 ).read_text(encoding="utf-8")
-ROUTING = (PROCESSING / "deploy_country_routing.sql").read_text(encoding="utf-8")
+ROUTING = (COUNTRY_ROUTING / "deploy_country_routing.sql").read_text(encoding="utf-8")
 RECONCILIATION = (
-    PROCESSING / "deploy_country_movement_reconciliation.sql"
+    COUNTRY_RECONCILIATION / "deploy_country_movement_reconciliation.sql"
 ).read_text(encoding="utf-8")
 PIPELINE_DEPLOYMENT = (
-    ORCHESTRATION / "deploy_unified_pipeline.sql"
+    UNIFIED_PIPELINE / "deploy_unified_pipeline.sql"
 ).read_text(encoding="utf-8")
 PIPELINE_MONITORING = (
-    ORCHESTRATION / "monitor_unified_pipeline.sql"
+    UNIFIED_PIPELINE / "monitor_unified_pipeline.sql"
 ).read_text(encoding="utf-8")
 
 TASKS = [
@@ -210,6 +215,31 @@ def test_unified_monitoring_reports_task_failures_incremental_counts_and_core_to
     assert "LAG(run.STATUS)" in PIPELINE_MONITORING
     assert "WHERE run.STATUS <> 'SUCCEEDED'" in PIPELINE_MONITORING
     assert "ETL_FILE_STAGE_STATUS" in PIPELINE_MONITORING
+
+
+def test_unified_monitoring_limits_both_task_history_queries_to_seven_days() -> None:
+    assert PIPELINE_MONITORING.count(
+        "DATEADD('DAY', -7, CURRENT_TIMESTAMP())"
+    ) == 2
+    assert not re.search(
+        r"DATEADD\s*\(\s*'DAY'\s*,\s*-30\b",
+        PIPELINE_MONITORING,
+        re.IGNORECASE,
+    )
+    assert PIPELINE_MONITORING.count(
+        "FROM TABLE(SKYPOINTS_DB.INFORMATION_SCHEMA.TASK_HISTORY("
+    ) == 2
+
+
+def test_unified_monitoring_preserves_task_history_correlation_and_failure_details() -> None:
+    assert PIPELINE_MONITORING.count("GRAPH_RUN_GROUP_ID") >= 2
+    assert "run.GRAPH_RUN_ID = history.GRAPH_RUN_GROUP_ID" in PIPELINE_MONITORING
+    assert "history.GRAPH_RUN_GROUP_ID = run.GRAPH_RUN_ID" in PIPELINE_MONITORING
+    assert "history.STATE IN ('FAILED', 'CANCELLED', 'SKIPPED')" in PIPELINE_MONITORING
+    assert "history.ERROR_MESSAGE AS TASK_ERROR" in PIPELINE_MONITORING
+    assert "ingestion.ERROR_DETAILS AS INGESTION_ERROR" in PIPELINE_MONITORING
+    assert "processing.ERROR_DETAILS AS PROCESSING_ERROR" in PIPELINE_MONITORING
+    assert "WHERE run.STATUS <> 'SUCCEEDED'" in PIPELINE_MONITORING
 
 
 def test_per_run_quarantine_counts_ignore_historical_quarantine_rows() -> None:

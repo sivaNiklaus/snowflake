@@ -6,19 +6,23 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 ROUTING = (
-    ROOT / "sql" / "processing" / "deploy_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "deploy_country_routing.sql"
 ).read_text(encoding="utf-8")
 RECONCILIATION = (
-    ROOT / "sql" / "processing" / "deploy_country_movement_reconciliation.sql"
+    ROOT / "sql" / "03_processing" / "country_movement_reconciliation"
+    / "deploy_country_movement_reconciliation.sql"
 ).read_text(encoding="utf-8")
 EXECUTION = (
-    ROOT / "sql" / "orchestration" / "execute_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "execute_country_routing.sql"
 ).read_text(encoding="utf-8")
 PIPELINE_DEPLOYMENT = (
-    ROOT / "sql" / "orchestration" / "deploy_unified_pipeline.sql"
+    ROOT / "sql" / "04_unified_pipeline" / "deploy_unified_pipeline.sql"
 ).read_text(encoding="utf-8")
 MONITORING = (
-    ROOT / "sql" / "orchestration" / "monitor_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "monitor_country_routing.sql"
 ).read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 SQL_README = (ROOT / "sql" / "README.md").read_text(encoding="utf-8")

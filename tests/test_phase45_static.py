@@ -7,16 +7,19 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOYMENT = (
-    ROOT / "sql" / "processing" / "deploy_ingestion_dq_and_business_transformation.sql"
+    ROOT / "sql" / "03_processing" / "dq_and_transformation"
+    / "deploy_ingestion_dq_and_business_transformation.sql"
 ).read_text(encoding="utf-8")
 TASK_DEPLOYMENT = (
-    ROOT / "sql" / "orchestration" / "deploy_ingestion_task_graph.sql"
+    ROOT / "sql" / "02_orchestration_ingestion" / "deploy_ingestion_task_graph.sql"
 ).read_text(encoding="utf-8")
 EXECUTION = (
-    ROOT / "sql" / "orchestration" / "execute_ingestion_dq_and_business_transformation.sql"
+    ROOT / "sql" / "03_processing" / "dq_and_transformation"
+    / "execute_ingestion_dq_and_business_transformation.sql"
 ).read_text(encoding="utf-8")
 MONITORING = (
-    ROOT / "sql" / "orchestration" / "monitor_ingestion_dq_and_business_transformation.sql"
+    ROOT / "sql" / "03_processing" / "dq_and_transformation"
+    / "monitor_ingestion_dq_and_business_transformation.sql"
 ).read_text(encoding="utf-8")
 MEMBER_LINES = (
     ROOT / "tests" / "fixtures" / "members" / "member_sample.dat"

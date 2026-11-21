@@ -3,7 +3,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORCHESTRATION = ROOT / "sql" / "orchestration"
+ORCHESTRATION = ROOT / "sql" / "02_orchestration_ingestion"
 DEPLOYMENT = (
     ORCHESTRATION / "deploy_ingestion_task_graph.sql"
 ).read_text(encoding="utf-8")

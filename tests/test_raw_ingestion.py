@@ -8,10 +8,10 @@ DEFINITIONS = (
     ROOT / "sources" / "definitions" / "02_raw_ingestion.sql"
 ).read_text(encoding="utf-8")
 MEMBER_PIPE = (
-    ROOT / "sql" / "ingestion" / "create_member_profile_pipe.sql"
+    ROOT / "sql" / "01_ingestion" / "pipes" / "create_member_profile_pipe.sql"
 ).read_text(encoding="utf-8")
 REDEMPTION_PIPE = (
-    ROOT / "sql" / "ingestion" / "create_redemption_pipe.sql"
+    ROOT / "sql" / "01_ingestion" / "pipes" / "create_redemption_pipe.sql"
 ).read_text(encoding="utf-8")
 MEMBER_FIXTURE = ROOT / "tests" / "fixtures" / "members" / "member_sample.dat"
 REDEMPTION_FIXTURE = (

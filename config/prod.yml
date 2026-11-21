@@ -1,0 +1,11 @@
+# Documentation template only; configure environment-specific values.
+environment: prod
+snowflake:
+  database: "<configure>"
+  warehouse: "<configure>"
+  connection_name: "<configure local Snowflake CLI connection>"
+storage:
+  integration: "<configure>"
+  s3_bucket: "<configure>"
+  member_prefix: "members/"
+  redemption_prefix: "redemptions/"

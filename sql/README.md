@@ -1,5 +1,43 @@
 # Snowflake SQL deployment
 
+## Directory guide
+
+| Directory | Purpose |
+| --- | --- |
+| `00_setup/` | One-time host-object bootstrap and account-level S3 storage integration setup. |
+| `01_ingestion/` | Standalone pipe creation, load, and validation scripts for Phase 2 ingestion. |
+| `02_orchestration_ingestion/` | Phase 3 ingestion-only task graph deployment, execution, and monitoring. |
+| `03_processing/dq_and_transformation/` | Phase 4-5 parsing, metadata-driven DQ, business processing, and related execution/monitoring. |
+| `03_processing/country_routing/` | Phase 6 country-routing deployment, execution, and monitoring. |
+| `03_processing/country_movement_reconciliation/` | Phase 6 country-movement reconciliation deployment. |
+| `04_unified_pipeline/` | Phase 7 unified Phase 3-6C orchestration deployment, execution, and monitoring. |
+
+Scripts prefixed `deploy_` install or update Snowflake objects; `execute_`
+scripts trigger work; `monitor_` scripts are read-only operational queries.
+The `00_setup/` scripts are setup operations, not part of routine pipeline
+execution. DCM object definitions remain under `sources/definitions/`.
+
+## Phase execution and dependencies
+
+Prepare the Phase 2 storage integration, DCM-managed infrastructure, and
+standalone pipes before deploying task graphs. Then deploy, in order:
+
+1. Phase 3 ingestion graph from `02_orchestration_ingestion/`.
+2. Phase 4-5 DQ and business-processing graph from
+   `03_processing/dq_and_transformation/`.
+3. Phase 6 country routing, then country movement reconciliation from their
+   respective `03_processing/` directories.
+4. Phase 7 unified orchestration from `04_unified_pipeline/`.
+
+The Phase 3 graph is the ingestion-only three-task graph. Phase 4-5 extends it
+with parsing, DQ, and core processing; Phase 6 adds country routing and
+reconciliation. Phase 7 depends on all of those objects and controls the
+complete nine-task Phase 3-6C graph. Use the Phase 7 unified execution script
+for an end-to-end run. Phase-specific execution scripts remain available for
+isolated operations and troubleshooting; they do not replace the unified
+entry point for a complete pipeline run. The root task remains manually
+triggered and suspended by default; deployment does not configure a schedule.
+
 ## Phase 3: raw ingestion task graph
 
 The task graph reuses the already-deployed external stages, named file formats,
@@ -12,7 +50,7 @@ definitions remain untouched.
 | Members | `SKYPOINTS_DB.RAW.MEMBER_S3_STAGE` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_CSV` | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW` |
 | Redemptions | `SKYPOINTS_DB.RAW.REDEMPTION_S3_STAGE` | `SKYPOINTS_DB.RAW.REDEMPTION_JSON` | `SKYPOINTS_DB.RAW.REDEMPTION_RAW` |
 
-`sql/orchestration/deploy_ingestion_task_graph.sql` creates the audit table,
+`sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql` creates the audit table,
 three SQL stored procedures, and three Snowflake tasks. Only the audit table,
 procedures, and tasks are managed by this script; database, schemas, warehouse,
 stages, formats, and raw tables remain the responsibility of the existing
@@ -20,7 +58,7 @@ deployment. The procedures use the same projections as the standalone COPY
 scripts:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/deploy_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql
 ```
 
 Run deployment with a role that can create procedures and tasks in
@@ -51,7 +89,7 @@ per-table COPY load history provides file-level de-duplication on reruns.
 After deploying the graph, execute:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/execute_ingestion_task_graph.sql
 ```
 
 The deployment script resumes the child tasks in dependency order and leaves
@@ -87,7 +125,7 @@ and an audit error message.
 Inspect recent task status and audit records with:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/monitor_ingestion_task_graph.sql
 ```
 
 The task-history table function covers the preceding seven days; the audit
@@ -114,10 +152,10 @@ The standalone manual COPY and validation scripts remain available for
 diagnostics, but should not run concurrently with this graph or active pipes:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/ingestion/load_member_profile.sql
-snow sql --connection <connection_name> --filename sql/ingestion/load_redemption.sql
-snow sql --connection <connection_name> --filename sql/ingestion/validate_member_profile.sql
-snow sql --connection <connection_name> --filename sql/ingestion/validate_redemption.sql
+snow sql --connection <connection_name> --filename sql/01_ingestion/load/load_member_profile.sql
+snow sql --connection <connection_name> --filename sql/01_ingestion/load/load_redemption.sql
+snow sql --connection <connection_name> --filename sql/01_ingestion/validate/validate_member_profile.sql
+snow sql --connection <connection_name> --filename sql/01_ingestion/validate/validate_redemption.sql
 ```
 
 Run local static checks with `python -m pytest`. These tests do not connect to
@@ -141,7 +179,7 @@ or ingestion procedures. Run the existing Phase 3 deployment first, then
 deploy the new DDL, procedures, and child tasks:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/processing/deploy_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql
 ```
 
 Use the same deployment role that owns the Phase 3 task graph. It needs create
@@ -166,7 +204,7 @@ All tasks use `SKYPOINTS_ETL_WH` and the same owning role. Execute the full
 graph only after both deployment scripts have succeeded:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/execute_ingestion_dq_and_business_transformation.sql
 ```
 
 The execution script resumes descendants in reverse dependency order, manually
@@ -177,7 +215,7 @@ descendants manually after reviewing task history.
 Monitor runs with:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/monitor_ingestion_dq_and_business_transformation.sql
 ```
 
 The monitor script includes task history, per-procedure audit, per-dataset DQ
@@ -249,14 +287,14 @@ After deploying Phase 3 and Phase 4-5, deploy the country configuration,
 dedicated audit, routing procedure, and suspended downstream task:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/deploy_country_routing.sql
 ```
 
 Then deploy the movement audit, reconciliation procedure/audit, and suspended
 reconciliation task:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/processing/deploy_country_movement_reconciliation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql
 ```
 
 The script seeds the exact approved alpha-3 country list (`USA`, `IND`, `GBR`,
@@ -307,7 +345,7 @@ remains after `TASK_REDEMPTION_PROCESSING`. Both use `SKYPOINTS_ETL_WH`, are
 suspended on deployment, and have no schedule. Manually execute the full graph:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/execute_country_routing.sql
 ```
 
 After deploying Phase 7, this compatibility execution script calls the
@@ -317,7 +355,7 @@ Phase 7 deployment, use the older Phase-specific execution scripts only with
 the understanding that their cleanup behavior is less comprehensive.
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/monitor_country_routing.sql
 ```
 
 The monitor script shows task history, configuration and table row-count
@@ -349,11 +387,11 @@ automatically.
 
 Deploy in dependency order after Phase 2 infrastructure is available:
 
-1. `sql/orchestration/deploy_ingestion_task_graph.sql`
-2. `sql/processing/deploy_ingestion_dq_and_business_transformation.sql`
-3. `sql/processing/deploy_country_routing.sql`
-4. `sql/processing/deploy_country_movement_reconciliation.sql`
-5. `sql/orchestration/deploy_unified_pipeline.sql`
+1. `sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql`
+2. `sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql`
+3. `sql/03_processing/country_routing/deploy_country_routing.sql`
+4. `sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql`
+5. `sql/04_unified_pipeline/deploy_unified_pipeline.sql`
 
 Use the same task-owning role for the graph and unified procedures. Deployment
 does not execute tasks; the root and all descendants are left suspended, with
@@ -361,7 +399,7 @@ no schedule. Run the entire Phase 3-6C graph only through the controlled
 entry-point script:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/execute_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/execute_unified_pipeline.sql
 ```
 
 `AUDIT.SP_RUN_COMPLETE_PIPELINE()` acquires a singleton run guard, resumes
@@ -395,7 +433,7 @@ operator clears the stale lock.
 Run consolidated operational monitoring with:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/monitor_unified_pipeline.sql
 ```
 
 The queries report recent graph and task outcomes/durations, run comparisons,
@@ -423,10 +461,11 @@ The remaining sections describe the earlier infrastructure setup for
 reference only. They are not steps in the Phase 3 task graph deployment above.
 
 DCM Project object definitions belong under `sources/definitions/`; Snowflake
-CLI does not upload SQL files from this directory. Phase 2 keeps the database,
-schemas, warehouse, file formats, raw tables, and external stages in DCM.
+CLI does not upload SQL files from this directory. The existing database and
+parent `AUDIT` schema are outside DCM management. DCM manages the declared
+project schemas, warehouse, file formats, raw tables, and external stages.
 Snowflake's DCM `DEFINE PIPE` feature is Preview, so the two pipes are created
-separately with conventional `CREATE PIPE` statements under `sql/ingestion/`.
+separately with conventional `CREATE PIPE` statements under `sql/01_ingestion/`.
 
 ### Existing Phase 2 deployment order
 
@@ -434,12 +473,12 @@ Deploy these steps in order:
 
 1. **Account-level storage integration.** Set the S3 bucket and prefix
    placeholders consistently in
-   [create_s3_storage_integration.sql](./create_s3_storage_integration.sql)
+   [create_s3_storage_integration.sql](./00_setup/create_s3_storage_integration.sql)
    and `sources/definitions/02_raw_ingestion.sql`. Run the account-level script
    with a role that can create storage integrations (typically `ACCOUNTADMIN`):
 
    ```powershell
-   snow sql --connection <connection_name> --filename sql/create_s3_storage_integration.sql
+   snow sql --connection <connection_name> --filename sql/00_setup/create_s3_storage_integration.sql
    ```
 
    The integration requires the AWS IAM role ARN. After the integration is
@@ -477,8 +516,8 @@ Deploy these steps in order:
    pipe scripts with an appropriately privileged Snowflake connection:
 
    ```powershell
-   snow sql --connection <connection_name> --filename sql/ingestion/create_member_profile_pipe.sql
-   snow sql --connection <connection_name> --filename sql/ingestion/create_redemption_pipe.sql
+   snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_member_profile_pipe.sql
+   snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_redemption_pipe.sql
    ```
 
    Each script creates one independent pipe with `AUTO_INGEST = TRUE`. Re-run

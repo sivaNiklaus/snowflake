@@ -36,7 +36,9 @@ def test_dcm_definitions_declare_required_foundation_objects() -> None:
 
 
 def test_dcm_bootstrap_only_creates_project_host_schema() -> None:
-    bootstrap = (ROOT / "sql" / "bootstrap_dcm.sql").read_text(encoding="utf-8")
+    bootstrap = (
+        ROOT / "sql" / "00_setup" / "bootstrap_dcm.sql"
+    ).read_text(encoding="utf-8")
 
     assert re.search(r"(?im)^CREATE DATABASE IF NOT EXISTS SKYPOINTS_DB\b", bootstrap)
     assert re.search(

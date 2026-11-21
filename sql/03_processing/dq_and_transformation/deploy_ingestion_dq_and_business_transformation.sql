@@ -1,5 +1,5 @@
 -- Combined Phase 4-5 deployment.
--- Run after sql/orchestration/deploy_ingestion_task_graph.sql, using the same
+-- Run after sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql, using the same
 -- deployment role that owns the existing task graph.
 
 CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.PHASE45_AUDIT

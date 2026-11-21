@@ -6,16 +6,20 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 ROUTING_DEPLOYMENT = (
-    ROOT / "sql" / "processing" / "deploy_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "deploy_country_routing.sql"
 ).read_text(encoding="utf-8")
 ROUTING_EXECUTION = (
-    ROOT / "sql" / "orchestration" / "execute_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "execute_country_routing.sql"
 ).read_text(encoding="utf-8")
 ROUTING_MONITORING = (
-    ROOT / "sql" / "orchestration" / "monitor_country_routing.sql"
+    ROOT / "sql" / "03_processing" / "country_routing"
+    / "monitor_country_routing.sql"
 ).read_text(encoding="utf-8")
 PHASE45_DEPLOYMENT = (
-    ROOT / "sql" / "processing" / "deploy_ingestion_dq_and_business_transformation.sql"
+    ROOT / "sql" / "03_processing" / "dq_and_transformation"
+    / "deploy_ingestion_dq_and_business_transformation.sql"
 ).read_text(encoding="utf-8")
 
 APPROVED_COUNTRIES = [

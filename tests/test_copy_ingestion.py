@@ -3,7 +3,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INGESTION = ROOT / "sql" / "ingestion"
+INGESTION = ROOT / "sql" / "01_ingestion" / "load"
 MEMBER_COPY = (INGESTION / "load_member_profile.sql").read_text(encoding="utf-8")
 REDEMPTION_COPY = (INGESTION / "load_redemption.sql").read_text(encoding="utf-8")
 
@@ -52,7 +52,9 @@ def test_validation_scripts_cover_counts_samples_metadata_and_copy_history() -> 
         ("validate_member_profile.sql", "MEMBER_PROFILE_RAW"),
         ("validate_redemption.sql", "REDEMPTION_RAW"),
     ):
-        sql = (INGESTION / script_name).read_text(encoding="utf-8")
+        sql = (
+            ROOT / "sql" / "01_ingestion" / "validate" / script_name
+        ).read_text(encoding="utf-8")
         assert f"FROM SKYPOINTS_DB.RAW.{table_name}" in sql
         assert re.search(r"SELECT COUNT\(\*\).*?FROM", sql, flags=re.DOTALL)
         assert re.search(r"LIMIT \d+", sql)
