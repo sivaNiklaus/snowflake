@@ -139,23 +139,65 @@ BEGIN
     END WHILE;
     CLOSE c_approved_country_tables;
 
-    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_VALID_CURRENT AS
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_MEMBER_STATUS AS
     SELECT
         member.MEMBER_ID,
-        NULLIF(UPPER(TRIM(member.COUNTRY)), '') AS COUNTRY_CODE
-    FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member
-    WHERE EXISTS
+        NULLIF(UPPER(TRIM(member.COUNTRY)), '') AS COUNTRY_CODE,
+        IFF(
+            EXISTS
+            (
+                SELECT 1
+                FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
+                WHERE config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY))
+                  AND config.IS_ACTIVE
+                  AND config.COUNTRY_CODE IN
+                  (
+                      'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
+                      'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
+                  )
+            ),
+            TRUE,
+            FALSE
+        ) AS HAS_VALID_DESTINATION
+    FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member;
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_VALID_CURRENT AS
+    SELECT MEMBER_ID, COUNTRY_CODE
+    FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_MEMBER_STATUS
+    WHERE HAS_VALID_DESTINATION;
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_PRESERVED AS
+    WITH invalid_destinations AS
     (
-        SELECT 1
-        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
-        WHERE config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY))
-          AND config.IS_ACTIVE
-          AND config.COUNTRY_CODE IN
-          (
-              'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-              'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-          )
-    );
+        SELECT MEMBER_ID, COUNTRY_CODE
+        FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_MEMBER_STATUS
+        WHERE NOT HAS_VALID_DESTINATION
+    ),
+    latest_quarantined_movements AS
+    (
+        SELECT
+            movement.MEMBER_ID,
+            movement.PREVIOUS_COUNTRY
+        FROM SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT AS movement
+        JOIN invalid_destinations AS invalid
+          ON invalid.MEMBER_ID = movement.MEMBER_ID
+         AND invalid.COUNTRY_CODE IS NOT DISTINCT FROM movement.DESTINATION_COUNTRY
+        WHERE movement.ACTION = 'QUARANTINED'
+          AND movement.STATUS = 'QUARANTINED'
+        QUALIFY ROW_NUMBER() OVER
+        (
+            PARTITION BY movement.MEMBER_ID
+            ORDER BY
+                IFF(movement.RUN_ID = :v_run_id, 1, 0) DESC,
+                movement.UPDATED_AT DESC
+        ) = 1
+    )
+    SELECT DISTINCT
+        movement.MEMBER_ID,
+        UPPER(TRIM(previous_country.VALUE::VARCHAR)) AS PREVIOUS_COUNTRY
+    FROM latest_quarantined_movements AS movement,
+         LATERAL SPLIT_TO_TABLE(movement.PREVIOUS_COUNTRY, ',') AS previous_country
+    WHERE previous_country.VALUE IS NOT NULL;
 
     SELECT COUNT(*)
       INTO :v_missing_route_count
@@ -185,28 +227,39 @@ BEGIN
     SELECT COUNT(*)
       INTO :v_wrong_country_count
       FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_ROUTED AS routed
-      LEFT JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member
+      LEFT JOIN SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_MEMBER_STATUS AS member
         ON member.MEMBER_ID = routed.MEMBER_ID
      WHERE member.MEMBER_ID IS NULL
-        OR routed.COUNTRY_CODE IS DISTINCT FROM NULLIF(UPPER(TRIM(member.COUNTRY)), '');
+        OR
+        (
+            member.HAS_VALID_DESTINATION
+            AND routed.COUNTRY_CODE IS DISTINCT FROM member.COUNTRY_CODE
+        )
+        OR
+        (
+            NOT member.HAS_VALID_DESTINATION
+            AND NOT EXISTS
+            (
+                SELECT 1
+                FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_PRESERVED AS preserved
+                WHERE preserved.MEMBER_ID = routed.MEMBER_ID
+                  AND preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE
+            )
+        );
 
     SELECT COUNT(*)
       INTO :v_invalid_destination_route_count
       FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_ROUTED AS routed
-      JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member
+      JOIN SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_MEMBER_STATUS AS member
         ON member.MEMBER_ID = routed.MEMBER_ID
-     WHERE NOT EXISTS
-     (
-         SELECT 1
-         FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
-         WHERE config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY))
-           AND config.IS_ACTIVE
-           AND config.COUNTRY_CODE IN
-           (
-               'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-               'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-           )
-     );
+     WHERE NOT member.HAS_VALID_DESTINATION
+       AND NOT EXISTS
+       (
+           SELECT 1
+           FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_PRESERVED AS preserved
+           WHERE preserved.MEMBER_ID = routed.MEMBER_ID
+             AND preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE
+       );
 
     SELECT COUNT(*)
       INTO :v_unapproved_table_count
@@ -333,13 +386,13 @@ BEGIN
         'NO_WRONG_COUNTRY_ROWS',
         IFF(:v_wrong_country_count = 0, 'PASSED', 'FAILED'),
         :v_wrong_country_count,
-        'orphan_or_wrong_country_rows=' || :v_wrong_country_count
+        'orphan_or_wrong_country_or_unpreserved_invalid_rows=' || :v_wrong_country_count
     ),
     (
         'NO_INVALID_DESTINATIONS_ROUTED',
         IFF(:v_invalid_destination_route_count = 0, 'PASSED', 'FAILED'),
         :v_invalid_destination_route_count,
-        'invalid_destination_rows_routed=' || :v_invalid_destination_route_count
+        'unpreserved_invalid_destination_rows=' || :v_invalid_destination_route_count
     ),
     (
         'ONLY_APPROVED_COUNTRY_TABLES',

@@ -97,11 +97,54 @@ def test_reconciliation_checks_all_required_routing_invariants() -> None:
         assert check_name in RECONCILIATION
     assert "HAVING COUNT(routed.MEMBER_ID) <> 1" in RECONCILIATION
     assert "HAVING COUNT(*) > 1" in RECONCILIATION
-    assert "IS DISTINCT FROM NULLIF(UPPER(TRIM(member.COUNTRY)), '')" in RECONCILIATION
+    assert "NULLIF(UPPER(TRIM(member.COUNTRY)), '') AS COUNTRY_CODE" in RECONCILIATION
+    assert "HAS_VALID_DESTINATION" in RECONCILIATION
     assert "STARTSWITH(tables.TABLE_NAME, 'MEMBER_')" in RECONCILIATION
     assert "TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE)" in RECONCILIATION
     assert "IS_ACTIVE IS NULL" in RECONCILIATION
     assert "NUMERIC_PRECISION IS DISTINCT FROM expected_columns.NUMERIC_PRECISION" in RECONCILIATION
+
+
+def test_valid_member_in_correct_country_passes_and_missing_member_fails() -> None:
+    assert "WHERE HAS_VALID_DESTINATION" in RECONCILIATION
+    assert "routed.COUNTRY_CODE = current_member.COUNTRY_CODE" in RECONCILIATION
+    assert "HAVING COUNT(routed.MEMBER_ID) <> 1" in RECONCILIATION
+    assert "COALESCE(COUNT_IF(" in RECONCILIATION
+    assert "), 0) <> 1" in RECONCILIATION
+
+
+def test_valid_member_in_wrong_country_fails() -> None:
+    wrong_country = RECONCILIATION.split(
+        "INTO :v_wrong_country_count", 1
+    )[1].split(";", 1)[0]
+    assert "member.HAS_VALID_DESTINATION" in wrong_country
+    assert "routed.COUNTRY_CODE IS DISTINCT FROM member.COUNTRY_CODE" in wrong_country
+
+
+def test_invalid_destination_preserves_only_audited_previous_country_rows() -> None:
+    assert "movement.ACTION = 'QUARANTINED'" in RECONCILIATION
+    assert "movement.STATUS = 'QUARANTINED'" in RECONCILIATION
+    assert "invalid.COUNTRY_CODE IS NOT DISTINCT FROM movement.DESTINATION_COUNTRY" in RECONCILIATION
+    assert "LATERAL SPLIT_TO_TABLE(movement.PREVIOUS_COUNTRY, ',')" in RECONCILIATION
+    wrong_country = RECONCILIATION.split(
+        "INTO :v_wrong_country_count", 1
+    )[1].split(";", 1)[0]
+    assert "NOT member.HAS_VALID_DESTINATION" in wrong_country
+    assert "preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE" in wrong_country
+    invalid_route = RECONCILIATION.split(
+        "INTO :v_invalid_destination_route_count", 1
+    )[1].split(";", 1)[0]
+    assert "NOT member.HAS_VALID_DESTINATION" in invalid_route
+    assert "NOT EXISTS" in invalid_route
+    assert "preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE" in invalid_route
+
+
+def test_invalid_destination_wrong_or_duplicate_routes_still_fail() -> None:
+    assert "GROUP BY MEMBER_ID\n          HAVING COUNT(*) > 1" in RECONCILIATION
+    assert "NO_DUPLICATE_COUNTRY_MEMBERS" in RECONCILIATION
+    assert "NO_INVALID_DESTINATIONS_ROUTED" in RECONCILIATION
+    assert "NOT EXISTS" in RECONCILIATION
+    assert "ONLY_APPROVED_COUNTRY_TABLES" in RECONCILIATION
 
 
 def test_reconciliation_is_persistent_idempotent_and_does_not_repair_data() -> None:
