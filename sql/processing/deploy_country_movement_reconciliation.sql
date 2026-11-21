@@ -33,6 +33,8 @@ DECLARE
     v_invalid_target_count NUMBER(38, 0) DEFAULT 0;
     v_null_active_count NUMBER(38, 0) DEFAULT 0;
     v_unapproved_table_count NUMBER(38, 0) DEFAULT 0;
+    v_null_member_id_count NUMBER(38, 0) DEFAULT 0;
+    v_duplicate_member_id_count NUMBER(38, 0) DEFAULT 0;
     v_missing_route_count NUMBER(38, 0) DEFAULT 0;
     v_duplicate_route_count NUMBER(38, 0) DEFAULT 0;
     v_wrong_country_count NUMBER(38, 0) DEFAULT 0;
@@ -100,6 +102,22 @@ BEGIN
       INTO :v_null_active_count
       FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
      WHERE IS_ACTIVE IS NULL;
+
+    SELECT COUNT(*)
+      INTO :v_null_member_id_count
+      FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT
+     WHERE MEMBER_ID IS NULL;
+
+    SELECT COUNT(*)
+      INTO :v_duplicate_member_id_count
+      FROM
+      (
+          SELECT MEMBER_ID
+          FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT
+          WHERE MEMBER_ID IS NOT NULL
+          GROUP BY MEMBER_ID
+          HAVING COUNT(*) > 1
+      ) AS duplicate_member_ids;
 
     CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_ROUTED
     (
@@ -370,6 +388,17 @@ BEGIN
         CHECK_NAME, STATUS, FAILURE_COUNT, ERROR_DETAILS
     )
     VALUES
+    (
+        'MEMBER_CURRENT_UNIQUE_MEMBER_ID',
+        IFF(
+            :v_null_member_id_count + :v_duplicate_member_id_count = 0,
+            'PASSED',
+            'FAILED'
+        ),
+        :v_null_member_id_count + :v_duplicate_member_id_count,
+        'null_member_id_rows=' || :v_null_member_id_count
+            || ', duplicated_member_id_groups=' || :v_duplicate_member_id_count
+    ),
     (
         'VALID_MEMBERS_EXACTLY_ONCE',
         IFF(:v_missing_route_count = 0, 'PASSED', 'FAILED'),

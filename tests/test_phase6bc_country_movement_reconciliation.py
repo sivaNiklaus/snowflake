@@ -86,6 +86,7 @@ def test_movement_audit_captures_lineage_and_failure_outcomes() -> None:
 
 def test_reconciliation_checks_all_required_routing_invariants() -> None:
     for check_name in (
+        "MEMBER_CURRENT_UNIQUE_MEMBER_ID",
         "VALID_MEMBERS_EXACTLY_ONCE",
         "NO_DUPLICATE_COUNTRY_MEMBERS",
         "NO_WRONG_COUNTRY_ROWS",
@@ -103,6 +104,28 @@ def test_reconciliation_checks_all_required_routing_invariants() -> None:
     assert "TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE)" in RECONCILIATION
     assert "IS_ACTIVE IS NULL" in RECONCILIATION
     assert "NUMERIC_PRECISION IS DISTINCT FROM expected_columns.NUMERIC_PRECISION" in RECONCILIATION
+
+
+def test_member_current_unique_member_id_fails_for_null_ids() -> None:
+    null_id_check = RECONCILIATION.split(
+        "INTO :v_null_member_id_count", 1
+    )[1].split(";", 1)[0]
+    assert "FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT" in null_id_check
+    assert "WHERE MEMBER_ID IS NULL" in null_id_check
+    assert "'MEMBER_CURRENT_UNIQUE_MEMBER_ID'" in RECONCILIATION
+    assert "'null_member_id_rows=' || :v_null_member_id_count" in RECONCILIATION
+
+
+def test_member_current_unique_member_id_fails_for_duplicate_ids() -> None:
+    duplicate_id_check = RECONCILIATION.split(
+        "INTO :v_duplicate_member_id_count", 1
+    )[1].split(";", 1)[0]
+    assert "FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT" in duplicate_id_check
+    assert "WHERE MEMBER_ID IS NOT NULL" in duplicate_id_check
+    assert "GROUP BY MEMBER_ID" in duplicate_id_check
+    assert "HAVING COUNT(*) > 1" in duplicate_id_check
+    assert "', duplicated_member_id_groups='" in RECONCILIATION
+    assert "|| :v_duplicate_member_id_count" in RECONCILIATION
 
 
 def test_valid_member_in_correct_country_passes_and_missing_member_fails() -> None:
