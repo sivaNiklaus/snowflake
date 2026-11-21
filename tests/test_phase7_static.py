@@ -88,6 +88,8 @@ def test_unified_runner_prevents_overlapping_graph_runs_and_reports_run_id() -> 
     assert "STATUS = 'IDLE'" in PIPELINE_DEPLOYMENT
     assert "v_lock_rows := SQLROWCOUNT" in PIPELINE_DEPLOYMENT
     assert "STATUS = 'BLOCKED'" in PIPELINE_DEPLOYMENT
+    assert "RAISE e_pipeline_run_blocked" in PIPELINE_DEPLOYMENT
+    assert "WHEN e_pipeline_run_blocked THEN" in PIPELINE_DEPLOYMENT
     assert "'graph_run_id', v_graph_run_id" in PIPELINE_DEPLOYMENT
     assert "GRAPH_RUN_GROUP_ID" in PIPELINE_DEPLOYMENT
     assert "STATUS = 'SUCCEEDED'" in PIPELINE_DEPLOYMENT

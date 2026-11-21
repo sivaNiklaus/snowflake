@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 import re
 import shutil
 import subprocess
@@ -33,17 +34,25 @@ TASKS_IN_SUSPEND_ORDER = (
 )
 
 DEPLOY_SQL_SEQUENCE = (
+    ("Bootstrap DCM host database and parent schema", "sql/00_setup/bootstrap_dcm.sql"),
     ("Member auto-ingest pipe", "sql/01_ingestion/pipes/create_member_profile_pipe.sql"),
     ("Redemption auto-ingest pipe", "sql/01_ingestion/pipes/create_redemption_pipe.sql"),
+    ("Validate ingestion pipe definitions", "sql/01_ingestion/pipes/validate_ingestion_pipes.sql"),
     ("Phase 3 ingestion graph", "sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql"),
     (
         "Phase 4-5 DQ and business processing",
-        "sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql",
+        (
+            "sql/03_processing/dq_and_transformation/"
+            "deploy_ingestion_dq_and_business_transformation.sql"
+        ),
     ),
     ("Phase 6A country routing", "sql/03_processing/country_routing/deploy_country_routing.sql"),
     (
         "Phase 6B-6C reconciliation",
-        "sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql",
+        (
+            "sql/03_processing/country_movement_reconciliation/"
+            "deploy_country_movement_reconciliation.sql"
+        ),
     ),
     ("Phase 7 unified orchestration", "sql/04_unified_pipeline/deploy_unified_pipeline.sql"),
     ("Suspend all pipeline tasks", "sql/05_lifecycle/suspend_pipeline_tasks.sql"),
@@ -152,7 +161,7 @@ RESOURCE_GROUPS = (
             "SKYPOINTS_DB.RAW.REDEMPTION_JSON",
             "SKYPOINTS_DB.RAW.MEMBER_S3_STAGE",
             "SKYPOINTS_DB.RAW.REDEMPTION_S3_STAGE",
-            "SKYPOINTS_ETL_WH (per DEV destroy policy)",
+            "SKYPOINTS_ETL_WH (per target destroy policy)",
             "SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV (project registration)",
         ),
     ),
@@ -161,17 +170,11 @@ RESOURCE_GROUPS = (
 PROTECTED_RESOURCES = (
     "SKYPOINTS_DB database",
     "SKYPOINTS_DB.AUDIT parent schema",
-    "SKYPOINTS_S3_STORAGE_INT storage integration",
+    "SKYPOINTS_S3_INT storage integration",
     "S3 bucket and uploaded objects",
     "AWS IAM roles, policies, and bucket notifications",
 )
 
-NO_CHANGE_MARKERS = (
-    "no changes",
-    "no change detected",
-    "nothing to deploy",
-    "already up to date",
-)
 PLACEHOLDER_PATTERN = re.compile(
     r"<[^>]*>|^(?:configure|placeholder|todo|tbd)(?:\b.*)?$",
     re.IGNORECASE,
@@ -188,12 +191,14 @@ class TargetConfig:
     name: str
     manifest_target: str
     connection_name: str
+    account_identifier: str
     database: str
     warehouse: str
     storage_integration: str
     s3_bucket: str
     member_prefix: str
     redemption_prefix: str
+    aws_role_arn_env: str
     project_name: str
     project_owner: str
     delete_warehouse: bool
@@ -268,12 +273,16 @@ def load_target_config(target: str, root: Path = ROOT) -> TargetConfig:
     required = {
         "environment": config.get("environment"),
         "snowflake.connection_name": snowflake.get("connection_name"),
+        "snowflake.account_identifier": snowflake.get("account_identifier"),
         "snowflake.database": snowflake.get("database"),
         "snowflake.warehouse": snowflake.get("warehouse"),
+        "snowflake.project_name": snowflake.get("project_name"),
+        "snowflake.project_owner": snowflake.get("project_owner"),
         "storage.integration": storage.get("integration"),
         "storage.s3_bucket": storage.get("s3_bucket"),
         "storage.member_prefix": storage.get("member_prefix"),
         "storage.redemption_prefix": storage.get("redemption_prefix"),
+        "storage.aws_role_arn_env": storage.get("aws_role_arn_env"),
     }
     missing = [key for key, value in required.items() if _is_placeholder(value)]
     if config.get("environment") != normalized:
@@ -286,95 +295,76 @@ def load_target_config(target: str, root: Path = ROOT) -> TargetConfig:
             f"{', '.join(missing)}. Refusing to contact Snowflake."
         )
 
-    project_name = target_definition.get("project_name")
-    project_owner = target_definition.get("project_owner")
-    account_identifier = target_definition.get("account_identifier")
-    manifest_missing = [
-        key
-        for key, value in (
-            ("account_identifier", account_identifier),
-            ("project_name", project_name),
-            ("project_owner", project_owner),
-        )
-        if _is_placeholder(value)
-    ]
-    if manifest_missing:
-        raise LifecycleError(
-            f"Target '{normalized}' has incomplete manifest settings: "
-            f"{', '.join(manifest_missing)}."
-        )
+    account_identifier = str(snowflake["account_identifier"]).strip()
+    project_name = str(snowflake["project_name"]).strip()
+    project_owner = str(snowflake["project_owner"]).strip()
 
-    if snowflake["database"] != str(project_name).split(".", 1)[0]:
+    if str(snowflake["database"]).upper() != project_name.split(".", 1)[0].upper():
         raise LifecycleError(
-            f"config/{normalized}.yml database does not match the DCM project "
-            f"database in manifest.yml."
+            f"config/{normalized}.yml snowflake.database must match the database "
+            "component of snowflake.project_name."
         )
     for label, value in (
         ("database", snowflake["database"]),
         ("warehouse", snowflake["warehouse"]),
         ("storage.integration", storage["integration"]),
+        ("snowflake.project_owner", project_owner),
     ):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", str(value)):
             raise LifecycleError(
                 f"config/{normalized}.yml {label} must be a Snowflake identifier."
             )
-    raw_definition = (
-        root / "sources" / "definitions" / "02_raw_ingestion.sql"
-    ).read_text(encoding="utf-8")
-    integration_names = {
-        match.upper()
-        for match in re.findall(
-            r"(?im)^\s*STORAGE_INTEGRATION\s*=\s*([A-Z0-9_]+)",
-            raw_definition,
-        )
-    }
-    if integration_names != {str(storage["integration"]).upper()}:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", account_identifier):
         raise LifecycleError(
-            f"config/{normalized}.yml storage.integration does not match "
-            "sources/definitions/02_raw_ingestion.sql."
+            f"config/{normalized}.yml snowflake.account_identifier is invalid."
         )
-    storage_integration_sql = (
-        root / "sql" / "00_setup" / "create_s3_storage_integration.sql"
-    ).read_text(encoding="utf-8")
-    created_integrations = {
-        match.upper()
-        for match in re.findall(
-            r"(?im)^\s*CREATE\s+STORAGE\s+INTEGRATION\s+([A-Z0-9_]+)",
-            storage_integration_sql,
-        )
-    }
-    if created_integrations != {str(storage["integration"]).upper()}:
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_$]*\.[A-Za-z_][A-Za-z0-9_$]*\."
+        r"[A-Za-z_][A-Za-z0-9_$]*",
+        project_name,
+    ):
         raise LifecycleError(
-            f"config/{normalized}.yml storage.integration does not match "
-            "sql/00_setup/create_s3_storage_integration.sql."
+            f"config/{normalized}.yml snowflake.project_name must be a "
+            "three-part Snowflake identifier."
         )
-    configured_urls = {
-        (bucket, prefix.rstrip("/") + "/")
-        for bucket, prefix in re.findall(
-            r"(?im)^\s*URL\s*=\s*'s3://([^/]+)/([^']+)'",
-            raw_definition,
-        )
-    }
-    expected_urls = {
-        (str(storage["s3_bucket"]), str(storage["member_prefix"])),
-        (str(storage["s3_bucket"]), str(storage["redemption_prefix"])),
-    }
-    if configured_urls != expected_urls:
+    if project_name.split(".")[1].upper() != "AUDIT":
         raise LifecycleError(
-            f"config/{normalized}.yml bucket/prefix settings do not match "
-            "the DCM external-stage URLs."
+            f"config/{normalized}.yml snowflake.project_name must be hosted in "
+            "the protected AUDIT parent schema."
+        )
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", str(storage["aws_role_arn_env"])):
+        raise LifecycleError(
+            f"config/{normalized}.yml storage.aws_role_arn_env must be an "
+            "environment variable name."
+        )
+    for label, value in (
+        ("storage.s3_bucket", storage["s3_bucket"]),
+        ("storage.member_prefix", storage["member_prefix"]),
+        ("storage.redemption_prefix", storage["redemption_prefix"]),
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", str(value)):
+            raise LifecycleError(
+                f"config/{normalized}.yml {label} contains unsupported characters."
+            )
+    if not str(storage["member_prefix"]).endswith("/") or not str(
+        storage["redemption_prefix"]
+    ).endswith("/"):
+        raise LifecycleError(
+            f"config/{normalized}.yml storage prefixes must end in '/'."
         )
 
     return TargetConfig(
         name=normalized,
         manifest_target=manifest_target,
         connection_name=str(snowflake["connection_name"]).strip(),
+        account_identifier=account_identifier,
         database=str(snowflake["database"]).strip(),
         warehouse=str(snowflake["warehouse"]).strip(),
         storage_integration=str(storage["integration"]).strip(),
         s3_bucket=str(storage["s3_bucket"]).strip(),
         member_prefix=str(storage["member_prefix"]).strip(),
         redemption_prefix=str(storage["redemption_prefix"]).strip(),
+        aws_role_arn_env=str(storage["aws_role_arn_env"]).strip(),
         project_name=str(project_name).strip(),
         project_owner=str(project_owner).strip(),
         delete_warehouse=destroy_policy["delete_warehouse"],
@@ -430,12 +420,14 @@ class LifecycleManager:
         self._global_help = ""
         self._dcm_help = ""
         self._sql_help = ""
+        self._active_dcm_project: Path | None = None
 
     def _invoke(
         self,
         args: Sequence[str],
         label: str,
         check: bool = True,
+        show_output: bool = True,
     ) -> subprocess.CompletedProcess:
         command = [self.executable, *args]
         self.output(f"==> {label}: {' '.join(command)}")
@@ -458,14 +450,100 @@ class LifecycleManager:
         stderr = result.stderr or ""
         self._last_stdout = stdout
         self._last_stderr = stderr
-        if stdout:
+        if show_output and stdout:
             self.output(stdout.rstrip())
-        if stderr:
+        if show_output and stderr:
             self.output(stderr.rstrip())
         if check and result.returncode != 0:
             details = (stderr or stdout or f"exit code {result.returncode}").strip()
             raise LifecycleError(f"{label} failed: {details}")
         return result
+
+    def _render_sql(self, text: str, extra_values: dict[str, str] | None = None) -> str:
+        values = {
+            "DATABASE": self.target.database.upper(),
+            "WAREHOUSE": self.target.warehouse.upper(),
+            "INTEGRATION": self.target.storage_integration.upper(),
+            "S3_BUCKET": self.target.s3_bucket,
+            "MEMBER_PREFIX": self.target.member_prefix,
+            "REDEMPTION_PREFIX": self.target.redemption_prefix,
+        }
+        if extra_values:
+            values.update(extra_values)
+        for key, value in values.items():
+            text = text.replace("{{" + key + "}}", value)
+        text = text.replace("SKYPOINTS_DB", self.target.database.upper())
+        text = text.replace("SKYPOINTS_ETL_WH", self.target.warehouse.upper())
+        unresolved = re.findall(r"\{\{[A-Z_]+\}\}", text)
+        if unresolved:
+            raise LifecycleError(
+                "Unresolved SQL configuration token(s): "
+                + ", ".join(sorted(set(unresolved)))
+            )
+        return text
+
+    def _run_sql_text(
+        self,
+        text: str,
+        label: str,
+        check: bool = True,
+        show_output: bool = True,
+        filename: str = "rendered.sql",
+    ) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory(prefix="skypoints-lifecycle-") as temp_dir:
+            path = Path(temp_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            return self._invoke(
+                [
+                    "sql",
+                    "--connection",
+                    self.target.connection_name,
+                    "--filename",
+                    str(path),
+                ],
+                label,
+                check=check,
+                show_output=show_output,
+            )
+
+    def _prepare_dcm_project(self) -> tempfile.TemporaryDirectory:
+        temp_dir = tempfile.TemporaryDirectory(prefix="skypoints-dcm-project-")
+        try:
+            project_dir = Path(temp_dir.name)
+            shutil.copy2(self.root / "manifest.yml", project_dir / "manifest.yml")
+            shutil.copytree(self.root / "sources", project_dir / "sources")
+
+            manifest_path = project_dir / "manifest.yml"
+            manifest = _read_yaml(manifest_path)
+            targets = manifest.get("targets")
+            if not isinstance(targets, dict) or self.target.manifest_target not in targets:
+                raise LifecycleError(
+                    f"manifest.yml must declare target {self.target.manifest_target}."
+                )
+            manifest["default_target"] = self.target.manifest_target
+            manifest["targets"][self.target.manifest_target] = {
+                "account_identifier": self.target.account_identifier,
+                "project_name": self.target.project_name,
+                "project_owner": self.target.project_owner,
+            }
+            manifest_path.write_text(
+                yaml.safe_dump(manifest, sort_keys=False),
+                encoding="utf-8",
+            )
+
+            for definition in (project_dir / "sources" / "definitions").glob("*.sql"):
+                rendered = definition.read_text(encoding="utf-8")
+                rendered = rendered.replace("SKYPOINTS_DB", self.target.database.upper())
+                rendered = rendered.replace(
+                    "SKYPOINTS_ETL_WH", self.target.warehouse.upper()
+                )
+                rendered = self._render_sql(rendered)
+                definition.write_text(rendered, encoding="utf-8")
+            return temp_dir
+        except Exception:
+            temp_dir.cleanup()
+            raise
 
     @staticmethod
     def _has_option(help_text: str, option: str) -> bool:
@@ -518,7 +596,7 @@ class LifecycleManager:
             ["dcm", command, "--help"],
             f"Inspect snow dcm {command} help",
         )
-        help_text = (help_result.stdout or "") + self._dcm_help + self._global_help
+        help_text = (help_result.stdout or "") + "\n" + (help_result.stderr or "")
         required_options = ("--target", "--connection")
         if command in {"create", "plan", "deploy"}:
             required_options += ("--from",)
@@ -533,48 +611,50 @@ class LifecycleManager:
             )
         args = ["dcm", command]
         if self._has_option(help_text, "--from"):
-            args.extend(["--from", "."])
+            project_dir = self._active_dcm_project or self.root
+            args.extend(["--from", str(project_dir)])
         args.extend(["--target", self.target.manifest_target])
         args.extend(["--connection", self.target.connection_name])
+        if command == "create" and self._has_option(help_text, "--if-not-exists"):
+            args.append("--if-not-exists")
         return args
 
     def _sql(
         self,
         script: str,
         label: str,
-        skip_if_already_exists: bool = False,
     ) -> None:
         path = self.root / script
         if not path.is_file():
             raise LifecycleError(f"Required SQL script is missing: {script}")
-        result = self._invoke(
-            [
-                "sql",
-                "--connection",
-                self.target.connection_name,
-                "--filename",
-                script,
-            ],
-            label,
-            check=not skip_if_already_exists,
-        )
-        if (
-            skip_if_already_exists
-            and result.returncode != 0
-            and self._already_exists(
-                (result.stdout or "") + (result.stderr or "")
-            )
-        ):
-            self.skipped.append(
-                f"{label} (already exists; existing pipe was not replaced)"
-            )
-            return
-        if result.returncode != 0:
-            details = (
-                result.stderr or result.stdout or f"exit code {result.returncode}"
-            ).strip()
-            raise LifecycleError(f"{label} failed: {details}")
+        sql = self._render_sql(path.read_text(encoding="utf-8"))
+        self._run_sql_text(sql, label, filename=script)
         self.completed.append(label)
+
+    def _identity_preflight(self) -> None:
+        account = self.target.account_identifier.replace("'", "''")
+        role = self.target.project_owner
+        sql = (
+            "EXECUTE IMMEDIATE $$\n"
+            "DECLARE\n"
+            "    e_wrong_account EXCEPTION (-20090, "
+            f"'Lifecycle operation requires Snowflake account {account}');\n"
+            "    e_wrong_role EXCEPTION (-20091, "
+            f"'Lifecycle operation requires active role {role}');\n"
+            "BEGIN\n"
+            f"    IF (UPPER(CURRENT_ACCOUNT()) <> UPPER('{account}')) THEN\n"
+            "        RAISE e_wrong_account;\n"
+            "    END IF;\n"
+            f"    IF (CURRENT_ROLE() <> '{role}') THEN\n"
+            "        RAISE e_wrong_role;\n"
+            "    END IF;\n"
+            "END;\n"
+            "$$;\n"
+        )
+        self._run_sql_text(
+            sql,
+            f"Validate Snowflake account and active role {role}",
+        )
 
     def _role_preflight(self) -> None:
         role = self.target.project_owner
@@ -597,19 +677,63 @@ class LifecycleManager:
             "END;\n"
             "$$;\n"
         )
-        with tempfile.TemporaryDirectory(prefix="skypoints-lifecycle-") as temp_dir:
-            path = Path(temp_dir) / "check_active_role.sql"
-            path.write_text(sql, encoding="utf-8")
-            self._invoke(
-                [
-                    "sql",
-                    "--connection",
-                    self.target.connection_name,
-                    "--filename",
-                    str(path),
-                ],
-                f"Validate database, integration, and active role {role}",
+        self._run_sql_text(
+            sql,
+            f"Validate database, integration, and active role {role}",
+        )
+
+    def _ensure_storage_integration(self) -> None:
+        integration = self.target.storage_integration.upper()
+        probe = self._run_sql_text(
+            f"DESC INTEGRATION {integration};",
+            f"Check storage integration {integration}",
+            check=False,
+            show_output=False,
+        )
+        if probe.returncode == 0:
+            self.skipped.append(
+                f"Storage integration {integration} already exists; left unchanged"
             )
+            return
+
+        details = (probe.stderr or probe.stdout or "").strip()
+        lowered = details.lower()
+        if not any(
+            marker in lowered
+            for marker in ("does not exist", "not found", "no such")
+        ):
+            raise LifecycleError(
+                f"Could not verify storage integration {integration}: "
+                f"{details or f'exit code {probe.returncode}'}"
+            )
+
+        role_arn = os.environ.get(self.target.aws_role_arn_env, "").strip()
+        if not re.fullmatch(
+            r"arn:aws(?:-[a-z0-9-]+)?:iam::\d{12}:role/"
+            r"[A-Za-z0-9+=,.@_/-]+",
+            role_arn,
+        ):
+            raise LifecycleError(
+                f"Storage integration {integration} is absent. Set "
+                f"{self.target.aws_role_arn_env} to the approved AWS IAM role ARN "
+                "before deploying; no integration was created."
+            )
+
+        template_path = self.root / "sql" / "00_setup" / "create_s3_storage_integration.sql"
+        if not template_path.is_file():
+            raise LifecycleError(
+                "Required SQL script is missing: "
+                "sql/00_setup/create_s3_storage_integration.sql"
+            )
+        sql = self._render_sql(
+            template_path.read_text(encoding="utf-8"),
+            {"AWS_IAM_ROLE_ARN": role_arn.replace("'", "''")},
+        )
+        self._run_sql_text(
+            sql,
+            f"Create account-level storage integration {integration}",
+        )
+        self.completed.append("Create account-level storage integration")
 
     @staticmethod
     def _already_exists(output: str) -> bool:
@@ -618,8 +742,17 @@ class LifecycleManager:
 
     @staticmethod
     def _plan_has_no_changes(output: str) -> bool:
-        lowered = output.lower()
-        return any(marker in lowered for marker in NO_CHANGE_MARKERS)
+        lines = (
+            ANSI_PATTERN.sub("", line).strip().lower()
+            for line in output.splitlines()
+        )
+        return any(
+            re.fullmatch(
+                r"(?:no changes(?: detected)?|nothing to deploy|already up to date)[.!]?",
+                line,
+            )
+            for line in lines
+        )
 
     def _print_summary(self, heading: str) -> None:
         self.output(f"\n{heading}")
@@ -637,42 +770,57 @@ class LifecycleManager:
     def deploy(self) -> None:
         try:
             self._probe_cli(require_dcm=True)
+            self._identity_preflight()
+            bootstrap_label, bootstrap_script = DEPLOY_SQL_SEQUENCE[0]
+            self._sql(bootstrap_script, bootstrap_label)
+            self._ensure_storage_integration()
             self._role_preflight()
 
-            create_args = self._dcm_args("create")
-            create_result = self._invoke(
-                create_args,
-                "Create/verify DCM project",
-                check=False,
-            )
-            create_output = (create_result.stdout or "") + (create_result.stderr or "")
-            if create_result.returncode == 0:
-                self.completed.append("Create/verify DCM project")
-            elif self._already_exists(create_output):
-                self.skipped.append("DCM project already exists")
-            else:
-                raise LifecycleError(
-                    "Create DCM project failed: "
-                    + (create_output.strip() or f"exit code {create_result.returncode}")
+            dcm_tempdir = self._prepare_dcm_project()
+            try:
+                self._active_dcm_project = Path(dcm_tempdir.name)
+                create_args = self._dcm_args("create")
+                create_result = self._invoke(
+                    create_args,
+                    "Create/verify DCM project",
+                    check=False,
                 )
-
-            plan_result = self._invoke(self._dcm_args("plan"), "Plan DCM deployment")
-            plan_text = (plan_result.stdout or "") + (plan_result.stderr or "")
-            self.completed.append("Plan DCM deployment")
-            if self._plan_has_no_changes(plan_text):
-                self.skipped.append("DCM deploy (plan reports no changes)")
-            else:
-                self._invoke(self._dcm_args("deploy"), "Deploy DCM-managed resources")
-                self.completed.append("Deploy DCM-managed resources")
-
-            for label, script in DEPLOY_SQL_SEQUENCE:
-                self._sql(
-                    script,
-                    label,
-                    skip_if_already_exists=script.startswith(
-                        "sql/01_ingestion/pipes/"
-                    ),
+                create_output = (
+                    (create_result.stdout or "") + (create_result.stderr or "")
                 )
+                if create_result.returncode == 0:
+                    self.completed.append("Create/verify DCM project")
+                elif self._already_exists(create_output):
+                    self.skipped.append("DCM project already exists")
+                else:
+                    raise LifecycleError(
+                        "Create DCM project failed: "
+                        + (
+                            create_output.strip()
+                            or f"exit code {create_result.returncode}"
+                        )
+                    )
+
+                plan_result = self._invoke(
+                    self._dcm_args("plan"),
+                    "Plan DCM deployment",
+                )
+                plan_text = (plan_result.stdout or "") + (plan_result.stderr or "")
+                self.completed.append("Plan DCM deployment")
+                if self._plan_has_no_changes(plan_text):
+                    self.skipped.append("DCM deploy (plan reports no changes)")
+                else:
+                    self._invoke(
+                        self._dcm_args("deploy"),
+                        "Deploy DCM-managed resources",
+                    )
+                    self.completed.append("Deploy DCM-managed resources")
+
+                for label, script in DEPLOY_SQL_SEQUENCE[1:]:
+                    self._sql(script, label)
+            finally:
+                self._active_dcm_project = None
+                dcm_tempdir.cleanup()
             self._print_summary("Deployment summary")
         except LifecycleError:
             self._print_summary("Deployment stopped; completed steps are listed above")
@@ -680,6 +828,7 @@ class LifecycleManager:
 
     def run_pipeline(self) -> None:
         self._probe_cli(require_dcm=False)
+        self._identity_preflight()
         self._sql(
             "sql/04_unified_pipeline/execute_unified_pipeline.sql",
             "Run unified Phase 3-6C pipeline",
@@ -687,6 +836,7 @@ class LifecycleManager:
 
     def monitor(self) -> None:
         self._probe_cli(require_dcm=False)
+        self._identity_preflight()
         self._sql(
             "sql/04_unified_pipeline/monitor_unified_pipeline.sql",
             "Monitor unified Phase 3-6C pipeline",
@@ -760,7 +910,7 @@ class LifecycleManager:
                 "dcm",
                 command,
                 "--from",
-                ".",
+                str(self._active_dcm_project or self.root),
                 "--target",
                 self.target.manifest_target,
                 "--connection",
@@ -789,10 +939,23 @@ class LifecycleManager:
         for group, resources in RESOURCE_GROUPS:
             self.output(f"{group}:")
             for resource in resources:
-                self.output(f"  - {resource}")
+                configured_resource = resource.replace(
+                    "SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV",
+                    self.target.project_name,
+                )
+                configured_resource = configured_resource.replace(
+                    "SKYPOINTS_DB", self.target.database.upper()
+                ).replace("SKYPOINTS_ETL_WH", self.target.warehouse.upper())
+                configured_resource = configured_resource.replace(
+                    "SKYPOINTS_S3_INT", self.target.storage_integration.upper()
+                )
+                self.output(f"  - {configured_resource}")
         self.output("Always protected:")
         for resource in PROTECTED_RESOURCES:
-            self.output(f"  - {resource}")
+            configured_resource = resource.replace(
+                "SKYPOINTS_DB", self.target.database.upper()
+            ).replace("SKYPOINTS_S3_INT", self.target.storage_integration.upper())
+            self.output(f"  - {configured_resource}")
         if not self.target.delete_warehouse:
             self.output(
                 "Warehouse deletion is disabled by target policy; complete destroy "
@@ -825,10 +988,13 @@ class LifecycleManager:
             allow_prod_destroy,
             self.input_fn,
         )
+        dcm_tempdir: tempfile.TemporaryDirectory | None = None
         try:
             self._probe_cli(require_dcm=True)
+            self._identity_preflight()
+            dcm_tempdir = self._prepare_dcm_project()
+            self._active_dcm_project = Path(dcm_tempdir.name)
             dcm_purge_args, dcm_drop_args = self._dcm_destroy_command()
-            self._role_preflight()
             for label, script in DESTROY_SQL_SEQUENCE:
                 self._sql(script, label)
             purge_result = self._invoke(
@@ -884,6 +1050,10 @@ class LifecycleManager:
                 "Destruction stopped; some completed steps may have removed resources"
             )
             raise
+        finally:
+            self._active_dcm_project = None
+            if dcm_tempdir is not None:
+                dcm_tempdir.cleanup()
 
 
 def build_parser() -> argparse.ArgumentParser:

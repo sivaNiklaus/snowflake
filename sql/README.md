@@ -468,62 +468,25 @@ project schemas, warehouse, file formats, raw tables, and external stages.
 Snowflake's DCM `DEFINE PIPE` feature is Preview, so the two pipes are created
 separately with conventional `CREATE PIPE` statements under `sql/01_ingestion/`.
 
-### Existing Phase 2 deployment order
+### Initial setup and deployment
 
-Deploy these steps in order:
+Use `python manage.py deploy --target dev` for bootstrap, integration
+verification/creation, DCM, pipes, and all standalone SQL in dependency order.
+The files in `sql/00_setup/` are configuration templates rendered by the
+lifecycle manager; do not pass them directly to `snow sql`.
 
-1. **Account-level storage integration.** Set the S3 bucket and prefix
-   placeholders consistently in
-   [create_s3_storage_integration.sql](./00_setup/create_s3_storage_integration.sql)
-   and `sources/definitions/02_raw_ingestion.sql`. Run the account-level script
-   with a role that can create storage integrations (typically `ACCOUNTADMIN`):
+The existing account-level integration is `SKYPOINTS_S3_INT`. The manager
+never replaces or deletes it. If it is absent, set the environment variable
+named by `storage.aws_role_arn_env` in `config/dev.yml` (currently
+`SKYPOINTS_AWS_IAM_ROLE_ARN`) to the AWS IAM role ARN. The integration create
+statement uses `IF NOT EXISTS` and derives the bucket and prefixes from the
+target configuration. AWS role trust, bucket access policy, and S3 event
+notifications remain externally managed and are not changed by deployment.
 
-   ```powershell
-   snow sql --connection <connection_name> --filename sql/00_setup/create_s3_storage_integration.sql
-   ```
-
-   The integration requires the AWS IAM role ARN. After the integration is
-   created, inspect `DESC INTEGRATION SKYPOINTS_S3_STORAGE_INT`. Configure the
-   AWS role trust relationship with `STORAGE_AWS_IAM_USER_ARN` as the trusted
-   principal and `STORAGE_AWS_EXTERNAL_ID` as the `sts:ExternalId` condition:
-
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Principal": { "AWS": "<STORAGE_AWS_IAM_USER_ARN>" },
-         "Action": "sts:AssumeRole",
-         "Condition": {
-           "StringEquals": {
-             "sts:ExternalId": "<STORAGE_AWS_EXTERNAL_ID>"
-           }
-         }
-       }
-     ]
-   }
-   ```
-
-   Grant that AWS role only `s3:ListBucket` for the configured prefixes and
-   `s3:GetObject` / `s3:GetObjectVersion` for objects under them. Do not put
-   AWS credentials in this repository.
-
-2. **DCM-managed objects.** Use the root README's DCM workflow to bootstrap
-   the host schema, create the project, review `snow dcm plan`, and deploy.
-   The integration must exist before DCM creates the external stages.
-
-3. **Standalone pipes.** After the stages and raw tables exist, execute both
-   pipe scripts with an appropriately privileged Snowflake connection:
-
-   ```powershell
-   snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_member_profile_pipe.sql
-   snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_redemption_pipe.sql
-   ```
-
-   Each script creates one independent pipe with `AUTO_INGEST = TRUE`. Re-run
-   DCM after changing DCM-managed objects; pipe definitions are managed by
-   these standalone scripts.
+The DCM source definitions are rendered from the same target settings before
+`snow dcm create`, `plan`, and `deploy`. The lifecycle also renders the
+standalone SQL target database and warehouse identifiers from configuration.
+All nine tasks are suspended at the end of deployment.
 
 4. **S3 event notifications.** Run `DESC PIPE
    SKYPOINTS_DB.RAW.MEMBER_PROFILE_PIPE` and `DESC PIPE

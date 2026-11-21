@@ -28,7 +28,7 @@ resources in this project.
 
 | Deployment area | Resources |
 | --- | --- |
-| Account setup | `SKYPOINTS_S3_STORAGE_INT` is created by `sql/00_setup/create_s3_storage_integration.sql`; it is account-scoped and protected from destroy. The bootstrap script creates `SKYPOINTS_DB` and `SKYPOINTS_DB.AUDIT` only if absent; both are protected. |
+| Account setup | `SKYPOINTS_S3_INT` is a Snowflake account-level integration, created only if absent from values in `config/<target>.yml` and `SKYPOINTS_AWS_IAM_ROLE_ARN`; it is protected from destroy. The bootstrap creates `SKYPOINTS_DB` and `SKYPOINTS_DB.AUDIT` only if absent; both are protected. |
 | Ingestion pipes | `SKYPOINTS_DB.RAW.MEMBER_PROFILE_PIPE`, `SKYPOINTS_DB.RAW.REDEMPTION_PIPE` |
 | Phase 3 | `AUDIT.INGESTION_AUDIT`; `RAW.SP_RUN_MEMBER_INGESTION()`, `RAW.SP_RUN_REDEMPTION_INGESTION()`, `RAW.SP_RUN_INGESTION_VALIDATION()`; tasks `TASK_MEMBER_INGESTION`, `TASK_REDEMPTION_INGESTION`, `TASK_INGESTION_VALIDATION` |
 | Phase 4-5 | `AUDIT.PHASE45_AUDIT`, `AUDIT.ETL_FILE_STAGE_STATUS`, `AUDIT.DQ_RULE_MASTER`, `AUDIT.DQ_EXECUTION`, `AUDIT.DQ_RULE_RESULT`; `STAGING.MEMBER_PROFILE_PARSED`, `STAGING.REDEMPTION_PARSED`, `STAGING.DQ_QUARANTINE`; `CORE.MEMBER_CURRENT`, `CORE.MEMBER_HISTORY`, `CORE.REDEMPTION_FACT`; four processing procedures and four processing tasks |
@@ -63,9 +63,9 @@ those external notification rules.
 
 ## DCM teardown support
 
-The Snowflake CLI was not installed in the implementation environment, so its
-version and command options could not be inspected here. At runtime, the
-lifecycle manager requires both `snow dcm purge` and `snow dcm drop`, and
+Snowflake CLI 3.34.0 was available for local help inspection; no account was
+contacted. At runtime, the lifecycle manager requires both `snow dcm purge`
+and `snow dcm drop`, and
 inspects each command's own help before any standalone deletion. Both help
 outputs must document the project directory (`--from`), target, and connection
 options. Purge help must document a non-interactive confirmation option:

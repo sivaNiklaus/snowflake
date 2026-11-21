@@ -26,7 +26,7 @@ def test_member_records_preserve_complete_lines_and_record_indicators() -> None:
     assert all(line.startswith("|") for line in lines)
 
     copy_projection = re.search(
-        r"SELECT\s+(.*?)\s+FROM @SKYPOINTS_DB\.RAW\.MEMBER_PROFILE_S3_STAGE",
+        r"SELECT\s+(.*?)\s+FROM @SKYPOINTS_DB\.RAW\.MEMBER_S3_STAGE",
         MEMBER_PIPE,
         flags=re.DOTALL,
     )
@@ -123,8 +123,8 @@ def test_json_documents_are_preserved_without_flattening() -> None:
 
 def test_pipes_are_independent_standalone_definitions_not_dcm_objects() -> None:
     assert "DEFINE PIPE" not in DEFINITIONS.upper()
-    assert "CREATE PIPE SKYPOINTS_DB.RAW.MEMBER_PROFILE_PIPE" in MEMBER_PIPE
-    assert "CREATE PIPE SKYPOINTS_DB.RAW.REDEMPTION_PIPE" in REDEMPTION_PIPE
+    assert "CREATE PIPE IF NOT EXISTS SKYPOINTS_DB.RAW.MEMBER_PROFILE_PIPE" in MEMBER_PIPE
+    assert "CREATE PIPE IF NOT EXISTS SKYPOINTS_DB.RAW.REDEMPTION_PIPE" in REDEMPTION_PIPE
     assert "AUTO_INGEST = TRUE" in MEMBER_PIPE
     assert "AUTO_INGEST = TRUE" in REDEMPTION_PIPE
     assert "MEMBER_PROFILE_PIPE" not in REDEMPTION_PIPE

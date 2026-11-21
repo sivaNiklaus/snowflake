@@ -40,15 +40,15 @@ def test_dcm_bootstrap_only_creates_project_host_schema() -> None:
         ROOT / "sql" / "00_setup" / "bootstrap_dcm.sql"
     ).read_text(encoding="utf-8")
 
-    assert re.search(r"(?im)^CREATE DATABASE IF NOT EXISTS SKYPOINTS_DB\b", bootstrap)
+    assert re.search(r"(?im)^CREATE DATABASE IF NOT EXISTS \{\{DATABASE\}\}", bootstrap)
     assert re.search(
-        r"(?im)^CREATE SCHEMA IF NOT EXISTS SKYPOINTS_DB\.AUDIT\b",
+        r"(?im)^CREATE SCHEMA IF NOT EXISTS \{\{DATABASE\}\}\.AUDIT\b",
         bootstrap,
     )
     assert "CREATE WAREHOUSE" not in bootstrap.upper()
 
 
-def test_environment_example_contains_credentials_as_blank_and_default_prefixes() -> None:
+def test_environment_example_contains_only_optional_storage_role_arn() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     assignments = {
         key: value
@@ -58,6 +58,4 @@ def test_environment_example_contains_credentials_as_blank_and_default_prefixes(
     }
 
     assert all(re.fullmatch(r"[A-Z][A-Z0-9_]*", key) for key in assignments)
-    assert assignments["AWS_S3_BUCKET"] == ""
-    assert assignments["AWS_S3_MEMBERS_PREFIX"] == "members/"
-    assert assignments["AWS_S3_REDEMPTIONS_PREFIX"] == "redemptions/"
+    assert assignments == {"SKYPOINTS_AWS_IAM_ROLE_ARN": ""}

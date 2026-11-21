@@ -110,6 +110,8 @@ $$
 DECLARE
     e_cleanup_failed EXCEPTION
         (-20071, 'Pipeline completed but one or more task descendants could not be suspended');
+    e_pipeline_run_blocked EXCEPTION
+        (-20072, 'Another unified pipeline execution is active');
     v_run_id VARCHAR DEFAULT UUID_STRING();
     v_graph_run_id VARCHAR;
     v_started_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
@@ -146,11 +148,7 @@ BEGIN
                ENDED_AT = CURRENT_TIMESTAMP(),
                ERROR_DETAILS = 'Another unified pipeline execution holds the run lock'
          WHERE RUN_ID = :v_run_id;
-        RETURN OBJECT_CONSTRUCT(
-            'run_id', v_run_id,
-            'status', 'BLOCKED',
-            'message', 'Another unified pipeline execution is active'
-        );
+        RAISE e_pipeline_run_blocked;
     END IF;
     v_lock_acquired := TRUE;
 
@@ -256,6 +254,8 @@ BEGIN
         'task_count', v_task_count
     );
 EXCEPTION
+    WHEN e_pipeline_run_blocked THEN
+        RAISE;
     WHEN OTHER THEN
         v_error_details := COALESCE(v_error_details, SQLERRM);
 

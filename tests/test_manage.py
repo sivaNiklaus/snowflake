@@ -42,8 +42,8 @@ class MockSnow:
         drop_options: str = "--from PATH\n--target TARGET\n--connection NAME",
         fail_script: str | None = None,
         fail_dcm: str | None = None,
-        existing_pipe: str | None = None,
         missing_dcm_project: str | None = None,
+        missing_integration: bool = False,
     ) -> None:
         self.plan_output = plan_output
         self.dcm_commands = dcm_commands
@@ -51,10 +51,13 @@ class MockSnow:
         self.drop_options = drop_options
         self.fail_script = fail_script
         self.fail_dcm = fail_dcm
-        self.existing_pipe = existing_pipe
         self.missing_dcm_project = missing_dcm_project
+        self.missing_integration = missing_integration
         self.calls: list[list[str]] = []
         self.preflight_sql = ""
+        self.identity_sql = ""
+        self.sql_contents: list[str] = []
+        self.dcm_project_contents: list[str] = []
 
     @staticmethod
     def _result(args: list[str], output: str = "", code: int = 0, error: str = ""):
@@ -84,7 +87,10 @@ class MockSnow:
         if len(command) == 3 and command[0] == "dcm" and command[2] == "--help":
             verb = command[1]
             flags = {
-                "create": "--target TARGET\n--connection NAME\n--from PATH\n",
+                "create": (
+                    "--target TARGET\n--connection NAME\n--from PATH\n"
+                    "--if-not-exists"
+                ),
                 "plan": "--target TARGET\n--connection NAME\n--from PATH\n",
                 "deploy": "--target TARGET\n--connection NAME\n--from PATH\n",
                 "purge": self.purge_options,
@@ -93,6 +99,15 @@ class MockSnow:
             return self._result(args, f"Options:\n{flags}")
         if len(command) >= 2 and command[0] == "dcm":
             verb = command[1]
+            if "--from" in command:
+                project_dir = Path(command[command.index("--from") + 1])
+                for source in (project_dir / "sources" / "definitions").glob("*.sql"):
+                    self.dcm_project_contents.append(
+                        source.read_text(encoding="utf-8")
+                    )
+                self.dcm_project_contents.append(
+                    (project_dir / "manifest.yml").read_text(encoding="utf-8")
+                )
             if verb == "plan":
                 return self._result(args, self.plan_output)
             if verb == self.missing_dcm_project:
@@ -104,17 +119,27 @@ class MockSnow:
             if "--filename" not in command:
                 raise AssertionError(f"Unexpected snow sql arguments: {command}")
             script = command[command.index("--filename") + 1]
-            if script.endswith("--help"):
-                return self._result(args, "Options:\n  --connection NAME\n  --filename FILE")
-            if "/skypoints-lifecycle-" in script.replace("\\", "/"):
-                self.preflight_sql = Path(script).read_text(encoding="utf-8")
-            if self.fail_script and script.replace("\\", "/").endswith(self.fail_script):
-                return self._result(args, code=1, error="mock SQL failure")
-            if (
-                self.existing_pipe
-                and script.replace("\\", "/").endswith(self.existing_pipe)
+            normalized = script.replace("\\", "/")
+            content = Path(script).read_text(encoding="utf-8")
+            self.sql_contents.append(content)
+            if "/skypoints-lifecycle-" in normalized:
+                if "CURRENT_ACCOUNT()" in content:
+                    self.identity_sql = content
+                elif "DESC DATABASE " in content and "DESC INTEGRATION " in content:
+                    self.preflight_sql = content
+            if self.missing_integration and content.strip().startswith(
+                "DESC INTEGRATION SKYPOINTS_S3_INT"
             ):
-                return self._result(args, code=1, error="Pipe already exists")
+                return self._result(
+                    args,
+                    code=1,
+                    error="Integration does not exist or not authorized",
+                )
+            if (
+                self.fail_script
+                and f"/{self.fail_script}" in normalized
+            ):
+                return self._result(args, code=1, error="mock SQL failure")
             return self._result(args, "SQL completed")
         if command[:2] == ["sql", "--help"]:
             return self._result(args, "Options:\n  --connection NAME\n  --filename FILE")
@@ -143,8 +168,9 @@ def sql_filenames(fake_snow: MockSnow) -> list[str]:
         args = call[1:]
         if args[:2] == ["sql", "--connection"] and "--filename" in args:
             path = args[args.index("--filename") + 1].replace("\\", "/")
-            if "/skypoints-lifecycle-" not in path:
-                result.append(path)
+            marker = "/sql/"
+            if marker in path:
+                result.append("sql/" + path.split(marker, 1)[1])
     return result
 
 
@@ -159,9 +185,11 @@ def dcm_actions(fake_snow: MockSnow) -> list[str]:
     ]
 
 
-def test_target_config_checks_dev_placeholders_and_target_definition() -> None:
-    with pytest.raises(manage.LifecycleError, match="connection_name"):
-        manage.load_target_config("dev")
+def test_target_config_reads_dev_values_and_rejects_unconfigured_targets() -> None:
+    target = manage.load_target_config("dev")
+    assert target.connection_name == "dev"
+    assert target.account_identifier == "GIMFDUR-DY25356"
+    assert target.storage_integration == "SKYPOINTS_S3_INT"
 
     with pytest.raises(manage.LifecycleError, match="no matching target"):
         manage.load_target_config("staging")
@@ -175,9 +203,88 @@ def test_valid_dev_configuration_matches_manifest_and_stage_resources(tmp_path: 
 
     assert target.manifest_target == "DEV"
     assert target.connection_name == "mock-dev"
-    assert target.storage_integration == "SKYPOINTS_S3_STORAGE_INT"
+    assert target.storage_integration == "SKYPOINTS_S3_INT"
+    assert target.account_identifier == "GIMFDUR-DY25356"
+    assert target.project_name == "SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV"
     assert target.s3_bucket == "skypoints-etl-dev-siva-0408"
     assert target.delete_warehouse is True
+
+
+def test_target_yaml_drives_rendered_dcm_and_standalone_sql(
+    tmp_path: Path,
+) -> None:
+    root = configured_dev_root(tmp_path)
+    config_path = root / "config" / "dev.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["snowflake"]["database"] = "SKYPOINTS_TEST_DB"
+    config["snowflake"]["warehouse"] = "SKYPOINTS_TEST_WH"
+    config["snowflake"]["project_name"] = (
+        "SKYPOINTS_TEST_DB.AUDIT.SKYPOINTS_DCM_PROJECT_TEST"
+    )
+    config["storage"]["integration"] = "SKYPOINTS_TEST_INT"
+    config["storage"]["s3_bucket"] = "skypoints-test-bucket"
+    config["storage"]["member_prefix"] = "members/test/"
+    config["storage"]["redemption_prefix"] = "redemptions/test/"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    fake = MockSnow()
+    target = manage.load_target_config("dev", root=root)
+    manager = manage.LifecycleManager(
+        target,
+        runner=fake,
+        output=lambda _text: None,
+        executable="snow",
+        root=ROOT,
+    )
+    manager.deploy()
+
+    assert any("SKYPOINTS_TEST_DB.RAW" in text for text in fake.dcm_project_contents)
+    assert any("SKYPOINTS_TEST_WH" in text for text in fake.dcm_project_contents)
+    assert any(
+        "STORAGE_INTEGRATION = SKYPOINTS_TEST_INT" in text
+        and "s3://skypoints-test-bucket/members/test/" in text
+        for text in fake.dcm_project_contents
+    )
+    assert any("CREATE DATABASE IF NOT EXISTS SKYPOINTS_TEST_DB" in text
+               for text in fake.sql_contents)
+    assert any("SKYPOINTS_TEST_DB.RAW.TASK_MEMBER_INGESTION" in text
+               for text in fake.sql_contents)
+    assert "DESC DATABASE SKYPOINTS_TEST_DB" in fake.preflight_sql
+
+
+def test_destroy_plan_uses_target_config_and_preserves_external_resources(
+    tmp_path: Path,
+) -> None:
+    root = configured_dev_root(tmp_path)
+    config_path = root / "config" / "dev.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["snowflake"]["database"] = "SKYPOINTS_TEST_DB"
+    config["snowflake"]["warehouse"] = "SKYPOINTS_TEST_WH"
+    config["snowflake"]["project_name"] = (
+        "SKYPOINTS_TEST_DB.AUDIT.SKYPOINTS_DCM_PROJECT_TEST"
+    )
+    config["storage"]["integration"] = "SKYPOINTS_TEST_INT"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    output: list[str] = []
+    target = manage.load_target_config("dev", root=root)
+    manager = manage.LifecycleManager(
+        target,
+        output=output.append,
+        executable="snow",
+        root=ROOT,
+    )
+
+    manager._print_destroy_plan()
+    plan = "\n".join(output)
+
+    assert "SKYPOINTS_TEST_DB.RAW" in plan
+    assert "SKYPOINTS_TEST_WH" in plan
+    assert "SKYPOINTS_TEST_DB.AUDIT.SKYPOINTS_DCM_PROJECT_TEST" in plan
+    assert "SKYPOINTS_TEST_INT storage integration" in plan
+    assert "S3 bucket and uploaded objects" in plan
+    assert "AWS IAM roles, policies, and bucket notifications" in plan
+    assert "SKYPOINTS_DB.RAW" not in plan
 
 
 def test_deploy_orders_dcm_and_standalone_sql_without_running_pipeline(
@@ -190,8 +297,10 @@ def test_deploy_orders_dcm_and_standalone_sql_without_running_pipeline(
 
     assert dcm_actions(fake) == ["create", "plan", "deploy"]
     assert sql_filenames(fake) == [
+        "sql/00_setup/bootstrap_dcm.sql",
         "sql/01_ingestion/pipes/create_member_profile_pipe.sql",
         "sql/01_ingestion/pipes/create_redemption_pipe.sql",
+        "sql/01_ingestion/pipes/validate_ingestion_pipes.sql",
         "sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql",
         "sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql",
         "sql/03_processing/country_routing/deploy_country_routing.sql",
@@ -203,8 +312,19 @@ def test_deploy_orders_dcm_and_standalone_sql_without_running_pipeline(
     assert manager.completed[-1] == "Suspend all pipeline tasks"
     assert "DESC DATABASE SKYPOINTS_DB" in fake.preflight_sql
     assert "DESC SCHEMA SKYPOINTS_DB.AUDIT" in fake.preflight_sql
-    assert "DESC INTEGRATION SKYPOINTS_S3_STORAGE_INT" in fake.preflight_sql
+    assert "DESC INTEGRATION SKYPOINTS_S3_INT" in fake.preflight_sql
     assert "CURRENT_ROLE() <> 'ACCOUNTADMIN'" in fake.preflight_sql
+    assert "CURRENT_ACCOUNT()" in fake.identity_sql
+    assert "GIMFDUR-DY25356" in fake.identity_sql
+    assert any("CREATE DATABASE IF NOT EXISTS SKYPOINTS_DB" in text for text in fake.sql_contents)
+    assert any(
+        "STORAGE_INTEGRATION = SKYPOINTS_S3_INT" in text
+        for text in fake.dcm_project_contents
+    )
+    assert any(
+        "URL = 's3://skypoints-etl-dev-siva-0408/members/'" in text
+        for text in fake.dcm_project_contents
+    )
 
 
 def test_deploy_skips_dcm_deploy_when_plan_is_up_to_date(tmp_path: Path) -> None:
@@ -215,6 +335,60 @@ def test_deploy_skips_dcm_deploy_when_plan_is_up_to_date(tmp_path: Path) -> None
 
     assert dcm_actions(fake) == ["create", "plan"]
     assert "DCM deploy (plan reports no changes)" in manager.skipped
+
+
+def test_dcm_plan_with_changes_is_not_skipped_for_unrelated_no_change_line(
+    tmp_path: Path,
+) -> None:
+    fake = MockSnow(plan_output="Plan: 1 to add\nExisting resource: no changes")
+    manager = make_manager(tmp_path, fake)
+
+    manager.deploy()
+
+    assert dcm_actions(fake) == ["create", "plan", "deploy"]
+    assert "DCM deploy (plan reports no changes)" not in manager.skipped
+
+
+def test_missing_storage_integration_requires_env_arn_before_dcm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SKYPOINTS_AWS_IAM_ROLE_ARN", raising=False)
+    fake = MockSnow(missing_integration=True)
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="SKYPOINTS_AWS_IAM_ROLE_ARN"):
+        manager.deploy()
+
+    assert "sql/00_setup/bootstrap_dcm.sql" in sql_filenames(fake)
+    assert dcm_actions(fake) == []
+
+
+def test_missing_storage_integration_is_created_from_config_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "SKYPOINTS_AWS_IAM_ROLE_ARN",
+        "arn:aws:iam::123456789012:role/SkyPointsReadOnly",
+    )
+    fake = MockSnow(missing_integration=True)
+    manager = make_manager(tmp_path, fake)
+
+    manager.deploy()
+
+    integration_sql = next(
+        text for text in fake.sql_contents
+        if "CREATE STORAGE INTEGRATION IF NOT EXISTS" in text
+    )
+    assert "SKYPOINTS_S3_INT" in integration_sql
+    assert "arn:aws:iam::123456789012:role/SkyPointsReadOnly" in integration_sql
+    assert "s3://skypoints-etl-dev-siva-0408/members/" in integration_sql
+    assert "s3://skypoints-etl-dev-siva-0408/redemptions/" in integration_sql
+    assert "DROP STORAGE INTEGRATION" not in "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for _, path in manage.DESTROY_SQL_SEQUENCE
+    )
 
 
 def test_deploy_refuses_dcm_syntax_not_documented_by_installed_help(
@@ -257,6 +431,14 @@ def test_run_and_monitor_use_separate_unified_scripts(
     assert dcm_actions(fake) == []
 
 
+def test_run_surfaces_snow_sql_failure(tmp_path: Path) -> None:
+    fake = MockSnow(fail_script="sql/04_unified_pipeline/execute_unified_pipeline.sql")
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="mock SQL failure"):
+        manager.run_pipeline()
+
+
 def test_deploy_failure_stops_and_reports_completed_steps(tmp_path: Path) -> None:
     output: list[str] = []
     fake = MockSnow(fail_script="sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql")
@@ -271,13 +453,18 @@ def test_deploy_failure_stops_and_reports_completed_steps(tmp_path: Path) -> Non
     assert any("Deployment stopped" in line for line in output)
 
 
-def test_existing_pipe_is_left_unchanged_and_deploy_continues(tmp_path: Path) -> None:
-    fake = MockSnow(existing_pipe="create_member_profile_pipe.sql")
+def test_existing_pipes_are_idempotent_and_validated(tmp_path: Path) -> None:
+    fake = MockSnow()
     manager = make_manager(tmp_path, fake)
 
     manager.deploy()
 
-    assert any("existing pipe was not replaced" in item for item in manager.skipped)
+    assert any("CREATE PIPE IF NOT EXISTS" in text for text in fake.sql_contents)
+    validation = next(
+        text for text in fake.sql_contents if "GET_DDL(" in text
+    )
+    assert "MEMBER_S3_STAGE" in validation
+    assert "REDEMPTION_S3_STAGE" in validation
     assert manager.completed[-1] == "Suspend all pipeline tasks"
 
 
@@ -300,8 +487,9 @@ def test_destroy_orders_standalone_teardown_then_purge_then_drop(
                 actual_operations.append(call[2])
         elif call[:2] == ["snow", "sql"] and "--filename" in call:
             filename = call[call.index("--filename") + 1].replace("\\", "/")
-            if "/skypoints-lifecycle-" not in filename:
-                actual_operations.append(filename)
+            marker = "/sql/"
+            if marker in filename:
+                actual_operations.append("sql/" + filename.split(marker, 1)[1])
     assert actual_operations == expected_sql + ["purge", "drop"]
     assert manager.completed[-3:] == [
         "DCM purge completed",
@@ -480,8 +668,9 @@ def test_destroy_respects_target_warehouse_policy_before_cli_invocation(
 
 def test_destroy_confirmation_and_production_safeguard() -> None:
     dev = manage.TargetConfig(
-        "dev", "DEV", "c", "SKYPOINTS_DB", "WH", "INT", "bucket",
-        "members/", "redemptions/", "DB.AUDIT.PROJECT", "ACCOUNTADMIN", True,
+        "dev", "DEV", "c", "GIMFDUR-DY25356", "SKYPOINTS_DB",
+        "WH", "INT", "bucket", "members/", "redemptions/",
+        "SKYPOINTS_AWS_IAM_ROLE_ARN", "DB.AUDIT.PROJECT", "ACCOUNTADMIN", True,
     )
     manage.require_destroy_confirmation(
         dev, False, "dev", False, input_fn=lambda _prompt: "unused"
@@ -492,8 +681,9 @@ def test_destroy_confirmation_and_production_safeguard() -> None:
         )
 
     prod = manage.TargetConfig(
-        "prod", "PROD", "c", "DB", "WH", "INT", "bucket",
-        "members/", "redemptions/", "DB.AUDIT.PROD", "ACCOUNTADMIN", True,
+        "prod", "PROD", "c", "GIMFDUR-DY25356", "DB", "WH", "INT", "bucket",
+        "members/", "redemptions/", "SKYPOINTS_AWS_IAM_ROLE_ARN",
+        "DB.AUDIT.PROD", "ACCOUNTADMIN", True,
     )
     with pytest.raises(manage.LifecycleError, match="allow-prod-destroy"):
         manage.require_destroy_confirmation(prod, True, None, False)
@@ -539,11 +729,11 @@ def test_dcm_and_standalone_deployment_steps_remain_separate() -> None:
         for _, script in manage.DEPLOY_SQL_SEQUENCE
     )
     assert not any(
-        "bootstrap_dcm.sql" in script
-        or "create_s3_storage_integration.sql" in script
+        "create_s3_storage_integration.sql" in script
         for _, script in manage.DEPLOY_SQL_SEQUENCE
     )
+    assert manage.DEPLOY_SQL_SEQUENCE[0][1] == "sql/00_setup/bootstrap_dcm.sql"
     assert manage.DESTROY_SQL_SEQUENCE[-1][1] == "sql/05_lifecycle/destroy_pipes.sql"
     assert manage.RESOURCE_GROUPS[-1][0].startswith("DCM-managed")
     assert "SKYPOINTS_DB database" in manage.PROTECTED_RESOURCES
-    assert "SKYPOINTS_S3_STORAGE_INT storage integration" in manage.PROTECTED_RESOURCES
+    assert "SKYPOINTS_S3_INT storage integration" in manage.PROTECTED_RESOURCES

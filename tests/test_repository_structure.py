@@ -10,6 +10,7 @@ EXPECTED_SQL_FILES = (
     "sql/00_setup/create_s3_storage_integration.sql",
     "sql/01_ingestion/pipes/create_member_profile_pipe.sql",
     "sql/01_ingestion/pipes/create_redemption_pipe.sql",
+    "sql/01_ingestion/pipes/validate_ingestion_pipes.sql",
     "sql/01_ingestion/load/load_member_profile.sql",
     "sql/01_ingestion/load/load_redemption.sql",
     "sql/01_ingestion/validate/validate_member_profile.sql",

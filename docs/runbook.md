@@ -17,70 +17,67 @@ python manage.py monitor --target dev
 python manage.py destroy --target dev
 ```
 
-Set `snowflake.connection_name` in `config/dev.yml` to the name of a local
-Snowflake CLI connection. The checked-in DEV file intentionally leaves this
-machine-specific value unconfigured. `manage.py` validates that value, the
-DCM manifest target, the configured storage integration and S3 stage URLs
-before contacting Snowflake. Staging and production are unavailable until
-their manifest targets and configurations are real; the command surface does
-not imply those environments are deployable.
+`config/dev.yml` is the source of truth for the DEV account, project,
+connection, database, warehouse, integration, and S3 locations. The manager
+renders DCM definitions and setup SQL from it in temporary files, then checks
+`CURRENT_ACCOUNT()` and `CURRENT_ROLE()` before setup. It requires the
+`SKYPOINTS_AWS_IAM_ROLE_ARN` environment variable only when the configured
+integration is absent; an existing integration is left unchanged. Staging and
+production remain unavailable until their manifest targets and configurations
+are real.
 
-Deploy performs a connection/role preflight against the configured DCM
-project owner, validates relevant `snow` and per-command `snow dcm --help`
-options, creates (or recognizes an existing) DCM project, plans and deploys
-DCM-managed definitions, then deploys in this order:
+Deploy validates the connection account and owner role, creates the host
+database and parent schema with `IF NOT EXISTS`, verifies or creates the
+account-level integration, validates relevant `snow` and per-command
+`snow dcm --help` options, then creates/plans/deploys DCM-managed definitions.
+Standalone objects are deployed in this order:
 
-1. Both standalone ingestion pipes.
-2. Phase 3 ingestion task graph.
-3. Phase 4-5 parsing, DQ, and business processing.
-4. Phase 6A country routing.
-5. Phase 6B-6C reconciliation.
-6. Phase 7 unified pipeline controls.
-7. Final task suspension from leaf to root.
+1. Bootstrap `SKYPOINTS_DB` and `SKYPOINTS_DB.AUDIT` if absent.
+2. Both standalone ingestion pipes, followed by definition validation.
+3. Phase 3 ingestion task graph.
+4. Phase 4-5 parsing, DQ, and business processing.
+5. Phase 6A country routing.
+6. Phase 6B-6C reconciliation.
+7. Phase 7 unified pipeline controls.
+8. Final task suspension from leaf to root.
 
 Deployment never calls the pipeline runner. Existing pipes are left unchanged
-when the CLI reports they already exist; the manager does not replace them or
-claim to validate their definition drift. All completed and skipped steps are
-reported, and a failure stops later steps. Because this is not one Snowflake
-transaction, a failed deployment may leave completed objects in place; fix
-the reported issue and rerun the idempotent steps.
+and verified against their expected stages, raw tables, and file formats. All
+completed and skipped steps are reported, and a failure stops later steps.
+Because this is not one Snowflake transaction, a failed deployment may leave
+completed objects in place; fix the reported issue and rerun the idempotent
+steps.
 
-The standalone SQL deployment order is:
+The lifecycle's exact deployment order is bootstrap, integration check/create,
+DCM create/plan/deploy, both pipes and pipe validation, Phase 3 ingestion,
+Phase 4-5 processing, Phase 6A routing, Phase 6B-6C reconciliation, Phase 7
+unified controls, and final task suspension. `manage.py` renders the DCM
+project and standalone SQL into temporary files from the target configuration;
+do not pass the templates directly to `snow sql`.
 
-```powershell
-snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_member_profile_pipe.sql
-snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_redemption_pipe.sql
-snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql
-snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql
-snow sql --connection <connection_name> --filename sql/03_processing/country_routing/deploy_country_routing.sql
-snow sql --connection <connection_name> --filename sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql
-snow sql --connection <connection_name> --filename sql/04_unified_pipeline/deploy_unified_pipeline.sql
-snow sql --connection <connection_name> --filename sql/05_lifecycle/suspend_pipeline_tasks.sql
-```
+For DCM, the manager inspects each installed subcommand's help before invoking
+`snow dcm create`, `plan`, or `deploy` for target `DEV` and the configured
+connection. Each command must document its required `--from`, `--target`, and
+`--connection` options. The `--from` value is the generated temporary project
+directory, not the repository path. If the installed CLI documents different
+syntax, the manager stops rather than guessing flags.
 
-For DCM, the manager first validates the installed command help, then invokes
-the repository-documented `snow dcm create`, `snow dcm plan`, and
-`snow dcm deploy` commands for target `DEV` and the configured connection.
-The manager requires each subcommand's help to document `--from`, `--target`,
-and `--connection` before it supplies `--from .`, `--target DEV`, and
-`--connection <connection_name>`. If the installed CLI documents a different
-syntax, the manager stops instead of guessing flags.
-
-`run` invokes the Phase 7 unified execution script. `monitor` invokes its
-read-only monitoring script. For destroy, the selected target and exact
-resource groups are printed before confirmation. Type the target name (for
-DEV, `DEV`) or pass `--yes`. A future configured `prod` additionally requires
-both `--yes` and `--allow-prod-destroy`. DEV's explicit destroy policy permits
-removal of `SKYPOINTS_ETL_WH`.
+`python manage.py run --target dev` invokes the Phase 7 unified execution
+script using the configured connection. `python manage.py monitor --target dev`
+invokes its read-only monitoring script. For destroy, the selected target and
+exact resource groups are printed before confirmation. Type the target name
+(for DEV, `DEV`) or pass `--yes`. A future configured `prod` additionally
+requires both `--yes` and `--allow-prod-destroy`. DEV's explicit destroy
+policy permits removal of `SKYPOINTS_ETL_WH`.
 
 Before standalone deletion, the manager inspects `snow dcm purge --help` and
 `snow dcm drop --help` separately. Both must document `--from`, `--target`, and
-`--connection`; the manager supplies the current project directory, configured
-target, and named connection using only those documented options. Purge help
-must also document a non-interactive confirmation option: `--force` is used
-only when purge help explicitly lists it; otherwise a documented `--yes` is
-used. If either command or required option is unsupported, the process stops
-before standalone resources are removed.
+`--connection`; the manager supplies the generated temporary project directory,
+configured target, and named connection using only those documented options.
+Purge help must also document a non-interactive confirmation option: `--force`
+is used only when purge help explicitly lists it; otherwise a documented
+`--yes` is used. If either command or required option is unsupported, the
+process stops before standalone resources are removed.
 
 After help and role preflight, destroy suspends all nine tasks leaf-to-root,
 then removes Phase 7, Phase 6B-6C, Phase 6A, Phase 4-5, Phase 3, and pipe
@@ -108,50 +105,42 @@ For exact ownership and the complete named resource list, see
 1. Install the Snowflake CLI version required by the root README and configure
    a named local connection. Credentials belong in the CLI profile or the
    organization's approved secret store, never in this repository.
-2. Review the target YAML files. `manage.py` consumes them; set the local
-   Snowflake CLI connection name in `config/dev.yml`. The S3 bucket, prefixes,
-   database, warehouse, and integration are matched against checked-in
-   definitions. Staging/prod placeholders are not deployable.
-3. Configure the S3 bucket and prefixes consistently in
-   `sources/definitions/02_raw_ingestion.sql` and
-   `sql/00_setup/create_s3_storage_integration.sql`. Configure the IAM role
-   ARN only in the account-level integration script. Establish the required
-   AWS role trust and least-privilege S3 access outside this repository.
-4. Bootstrap the existing DCM host database/schema only when needed using
-   `sql/00_setup/bootstrap_dcm.sql`. The `SKYPOINTS_DB` database and parent
-   `AUDIT` schema are deliberately excluded from DCM object management.
+2. Keep target-specific Snowflake and S3 values in `config/dev.yml`; the
+   lifecycle renders the DCM sources and setup SQL from that file. Staging and
+   production remain unavailable until their manifest targets and complete
+   configurations exist.
+3. If `SKYPOINTS_S3_INT` is absent, set `SKYPOINTS_AWS_IAM_ROLE_ARN` in the
+   process environment. Establish AWS role trust and least-privilege S3
+   access outside this repository. Deployment never changes AWS resources.
+4. Bootstrap, storage integration verification/creation, DCM, pipes, and all
+   standalone SQL are part of `python manage.py deploy --target dev`; do not
+   run setup templates directly. The database and parent `AUDIT` schema are
+   created only if absent and remain outside DCM management.
 
 ## DCM deployment versus standalone SQL
 
-Use the DCM workflow for the definitions in `sources/definitions/`: review the
-plan before deployment because DCM may alter or drop objects it manages. The
-standalone account-level S3 storage integration and pipe scripts are run
-separately. Task, stored-procedure, and audit deployments are also standalone
-SQL files under `sql/`; they are not part of the DCM project upload.
+DCM manages the resources in the rendered `sources/definitions/` project.
+Standalone setup, pipe, task, procedure, audit, processing, routing, and
+reconciliation objects are rendered/executed by `manage.py` in dependency
+order. The plan is printed and changes are applied in the same deploy command;
+DCM may alter or remove only DCM-managed objects.
 
 The GitHub Actions workflow runs Python static tests only. It does not deploy
 to Snowflake.
 
 ## Deployment order
 
-Complete prerequisite setup before deploying task orchestration:
+`python manage.py deploy --target dev` performs these steps:
 
-1. Create/verify the storage integration with
-   `sql/00_setup/create_s3_storage_integration.sql`.
-2. Bootstrap the DCM host as needed, review the DCM plan, and deploy the
-   definitions under `sources/definitions/`.
-3. Create the member and redemption pipes with the two scripts in
-   `sql/01_ingestion/pipes/`.
-4. Deploy the Phase 3 graph with
-   `sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql`.
-5. Deploy Phase 4-5 with
-   `sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql`.
-6. Deploy Phase 6 country routing with
-   `sql/03_processing/country_routing/deploy_country_routing.sql`, followed
-   by reconciliation with
-   `sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql`.
-7. Deploy unified Phase 7 orchestration last with
-   `sql/04_unified_pipeline/deploy_unified_pipeline.sql`.
+1. Validate Snowflake account/role; bootstrap the database and `AUDIT` schema.
+2. Leave the existing integration unchanged or create it if absent.
+3. Create, plan, and deploy the rendered DCM project.
+4. Create both pipes, validate their definitions, then deploy Phase 3.
+5. Deploy Phase 4-5, Phase 6A, Phase 6B-6C, and Phase 7.
+6. Suspend all nine tasks leaf-to-root.
+
+The command does not execute the pipeline. A failure stops subsequent steps
+and reports completed work; rerun after fixing the reported issue.
 
 `python manage.py deploy --target dev` runs this DCM and standalone SQL
 sequence, including the final leaf-to-root task suspension. Do not separately
@@ -164,10 +153,11 @@ spanning this pipeline.
 
 ## Execute the unified pipeline
 
-The preferred complete Phase 3-6C entry point is:
+The preferred complete Phase 3-6C entry point uses the configured Snowflake
+CLI connection:
 
 ```powershell
-snow sql --connection <connection_name> --filename sql/04_unified_pipeline/execute_unified_pipeline.sql
+python manage.py run --target dev
 ```
 
 This calls `SKYPOINTS_DB.AUDIT.SP_RUN_COMPLETE_PIPELINE()`. It guards against
@@ -183,11 +173,11 @@ entry point.
 
 ## Monitor successful and failed runs
 
-Use `sql/04_unified_pipeline/monitor_unified_pipeline.sql` for recent graph
-runs, task-level history, file checkpoints, ingestion/DQ totals, live core
-table totals, country routing counts, reconciliation status, and failure
-details. The task-history lookback is limited to seven days; pipeline and
-domain audit records retain their own history.
+Run `python manage.py monitor --target dev` for recent graph runs, task-level
+history, file checkpoints, ingestion/DQ totals, live core table totals,
+country routing counts, reconciliation status, and failure details. The
+task-history lookback is limited to seven days; pipeline and domain audit
+records retain their own history.
 
 For diagnosis, correlate the pipeline audit `RUN_ID` / `GRAPH_RUN_ID` with
 `AUDIT.INGESTION_AUDIT`, `AUDIT.DQ_EXECUTION`, `AUDIT.DQ_RULE_RESULT`,

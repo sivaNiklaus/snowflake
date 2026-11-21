@@ -46,22 +46,24 @@ python manage.py monitor --target dev
 python manage.py destroy --target dev
 ```
 
-Configure `snowflake.connection_name` in `config/dev.yml` to match a local
-Snowflake CLI connection before running these commands. DEV's database,
-warehouse, bucket, prefixes, and integration are populated from the verified
-repository definitions. Provision the account-level storage integration once
-with the configured IAM role before deploying; the manager validates it but
-does not create or delete it. The manager validates the connection role against
-the DCM target owner before deploy/destroy, checks the installed Snowflake CLI
-help for the commands and options it will use, then invokes `snow` through
-subprocesses. It does not use a Python Snowflake connector.
+DEV's account, DCM project, database, warehouse, connection name, bucket,
+prefixes, and integration are configured in `config/dev.yml`. The DCM manifest
+and SQL definitions are rendered from that target configuration in a temporary
+project/SQL directory; generated files are not committed. The lifecycle checks
+the current account and role before any setup. `SKYPOINTS_AWS_IAM_ROLE_ARN` is
+required only if the configured storage integration does not already exist.
+An existing integration is left unchanged and is never removed by destroy.
+Snowflake CLI credentials remain in the local CLI profile; no Python connector
+is used.
 
-Deploy runs `snow dcm create`, `plan`, and (when the plan has changes) `deploy`,
-then creates the pipes and deploys Phases 3, 4-5, 6A, 6B-6C, and 7 in
-dependency order. It does not run the pipeline and explicitly leaves all nine
-tasks suspended. On failure it stops and lists completed steps; rerun after
-resolving the reported issue. The standalone scripts are rerunnable except
-existing pipes are kept rather than replaced when already present.
+Deploy validates the account and role, bootstraps the database and parent
+`AUDIT` schema with `IF NOT EXISTS`, creates the storage integration only if
+absent, and runs `snow dcm create`, `plan`, and (when the plan has changes)
+`deploy`. It then creates/validates the pipes and deploys Phases 3, 4-5, 6A,
+6B-6C, and 7 in dependency order. It does not run the pipeline and explicitly
+leaves all nine tasks suspended. Existing pipes are not replaced; their
+definitions are verified and deployment stops if they drift. On failure it
+stops and lists completed steps; rerun after resolving the reported issue.
 
 `run` invokes the unified Phase 3-6C execution script; `monitor` invokes its
 read-only monitoring script. For `destroy`, type `DEV` at the prompt or use
@@ -85,8 +87,8 @@ configured, requires both `--yes` and `--allow-prod-destroy`.
 
 The current manifest defines only `DEV`. `staging` and `prod` are rejected
 until real manifest targets and complete configuration files exist. The
-current development host had no Snowflake CLI installed, so command options
-could not be checked locally; runtime help validation prevents guessed flags.
+lifecycle validates installed CLI help before invoking DCM commands, and its
+preflight rejects a connection pointed at the wrong Snowflake account.
 See the [resource inventory](docs/resource-inventory.md) and
 [runbook](docs/runbook.md) for ownership, sequencing, and recovery details.
 
@@ -493,54 +495,41 @@ snow --version
 
 DCM Projects require Snowflake CLI 3.24.0 or later. This project's manifest
 format was verified against CLI 3.34.0 and Snowflake's official DCM project
-documentation. The `DEV` target in `manifest.yml` is configured with account
-identifier `GIMFDUR-DY25356`, project name
-`SKYPOINTS_DB.AUDIT.SKYPOINTS_DCM_PROJECT_DEV`, and project owner
-`ACCOUNTADMIN`. Use a named Snowflake CLI connection for that account and
-confirm the configured owner has the needed privileges. Configure the
-connection using the
+documentation. Target account and project settings are maintained in
+`config/dev.yml`; the lifecycle renders a temporary DCM manifest from those
+values. Use the named `dev` Snowflake CLI connection for that account and
+confirm the configured owner has the needed privileges. See the
 [Snowflake CLI connection guide](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/connect).
-Do not put credentials in this repository. `.env.example` contains a blank
-bucket setting and default prefixes only; set the bucket and prefixes in the
-SQL templates before deployment. Snowflake CLI connection profiles and your
-organization's approved secret manager are responsible for authentication.
+Do not put credentials in this repository. The account-level IAM role ARN is
+read from `SKYPOINTS_AWS_IAM_ROLE_ARN` only if the existing
+`SKYPOINTS_S3_INT` integration is absent. Snowflake CLI connection profiles
+and your organization's approved secret manager are responsible for
+authentication.
 
-### First-time DCM setup
+### First-time deployment
 
-The `DEV` target uses the configured account identifier, project name, and
-project owner documented above; it is not a placeholder template. Confirm that
-the Snowflake CLI connection targets that account and that the configured
-owner has the required privileges. The DCM project object is located in
-`SKYPOINTS_DB.AUDIT`, so bootstrap that database and schema first using an
-authorized Snowflake CLI connection:
-
-```powershell
-snow sql --connection <connection_name> --filename sql/00_setup/bootstrap_dcm.sql
-```
-
-Then create the DCM project, preview its planned changes, and deploy only after
-review:
+The DCM project object is located in `SKYPOINTS_DB.AUDIT`. The lifecycle
+bootstraps that database/schema with `IF NOT EXISTS`, leaves an existing
+storage integration unchanged (or creates it if absent), then renders the DCM
+project from `config/dev.yml`. Run the complete deployment with:
 
 ```powershell
-snow dcm create --from . --target DEV --connection <connection_name>
-snow dcm plan --from . --target DEV --connection <connection_name>
-snow dcm deploy --from . --target DEV --connection <connection_name>
+python manage.py deploy --target dev
 ```
 
-The `plan` and `deploy` commands require a working Snowflake account connection
-and appropriate privileges. DCM deployment can alter or drop objects managed
-by the project, so inspect the plan before deploying. The bootstrap SQL
-creates only the database and `AUDIT` schema required to host the DCM project;
-the existing database and `AUDIT` parent schema remain outside DCM management.
-DCM manages the declared `RAW`, `STAGING`, `CORE`, and `ANALYTICS` schemas,
-warehouse, and Phase 2 raw-ingestion objects. Snowflake also creates a default
-`PUBLIC` schema with a database; it is not managed by this project's definitions.
+The deployment validates the current Snowflake account and role, prints the
+DCM plan, and applies planned changes in the same command; DCM can alter or
+remove DCM-managed objects. The parent database and `AUDIT` schema, storage
+integration, S3 data, and AWS resources remain outside DCM ownership and are
+protected from destroy.
 
-## Existing infrastructure deployment
+## Infrastructure and standalone SQL
 
-The Phase 1/2 infrastructure setup is documented in [sql/README.md](sql/README.md).
-Do not rerun it as part of Phase 3. In particular, Phase 3 does not execute
-the existing pipe creation scripts.
+The lifecycle command includes initial setup, DCM, both auto-ingest pipes,
+Phases 3–7, and final task suspension. Do not separately execute deployment
+scripts during the same lifecycle run. Resource ownership and manual recovery
+details are in [sql/README.md](sql/README.md) and
+[docs/runbook.md](docs/runbook.md).
 
 ## Phase 3 execution
 
