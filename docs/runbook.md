@@ -73,15 +73,32 @@ DEV, `DEV`) or pass `--yes`. A future configured `prod` additionally requires
 both `--yes` and `--allow-prod-destroy`. DEV's explicit destroy policy permits
 removal of `SKYPOINTS_ETL_WH`.
 
-Destroy suspends all nine tasks leaf-to-root, then removes Phase 7, Phase 6B-6C,
-Phase 6A, Phase 4-5, Phase 3, and pipe objects in reverse deployment order.
-The Snowflake CLI's own DCM help is inspected before any deletion. If it does
-not document a target-scoped teardown command, destroy stops before removing
-standalone resources. When supported, that CLI teardown removes the DCM
-resources, including the project-owned warehouse. It never removes the
-database, parent `AUDIT` schema, storage integration, S3 data, AWS IAM
-resources, or bucket notifications. Destroy is irreversible for the listed
-audit and quarantine tables; it is not a data-backup mechanism.
+Before standalone deletion, the manager inspects `snow dcm purge --help` and
+`snow dcm drop --help` separately. Both must document `--from`, `--target`, and
+`--connection`; the manager supplies the current project directory, configured
+target, and named connection using only those documented options. Purge help
+must also document a non-interactive confirmation option: `--force` is used
+only when purge help explicitly lists it; otherwise a documented `--yes` is
+used. If either command or required option is unsupported, the process stops
+before standalone resources are removed.
+
+After help and role preflight, destroy suspends all nine tasks leaf-to-root,
+then removes Phase 7, Phase 6B-6C, Phase 6A, Phase 4-5, Phase 3, and pipe
+objects in reverse deployment order. It runs DCM purge only after standalone
+teardown succeeds, then runs DCM drop only after purge succeeds. The summary
+distinguishes **DCM purge completed**, **DCM project dropped**, and
+**Complete destruction completed**. A purge failure prevents drop. If purge
+reports the project is already absent, the manager does not count it as a
+successful purge; managed entities may remain, so complete destruction is not
+reported. If drop fails after purge, the summary records the successful purge
+but not a dropped project or completed destruction.
+
+The DCM purge removes project-managed entities, grants, and attachments; drop
+removes the DCM project object and deployment history. DCM teardown includes
+the project-owned warehouse only when the target's destroy policy permits it.
+It never removes the database, parent `AUDIT` schema, storage integration, S3
+data, AWS IAM resources, or bucket notifications. Destroy is irreversible for
+the listed audit and quarantine tables; it is not a data-backup mechanism.
 
 For exact ownership and the complete named resource list, see
 [`resource-inventory.md`](resource-inventory.md).

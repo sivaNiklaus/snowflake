@@ -64,22 +64,30 @@ resolving the reported issue. The standalone scripts are rerunnable except
 existing pipes are kept rather than replaced when already present.
 
 `run` invokes the unified Phase 3-6C execution script; `monitor` invokes its
-read-only monitoring script. For `destroy`, type `DEV` at the prompt or use `--yes`. If the installed DCM
-CLI exposes a target-scoped teardown command, destroy suspends tasks leaf-to-root
-and removes standalone objects in reverse deployment order before invoking
-that DCM command. The DEV destroy policy permits deletion of the project-owned
-warehouse. It always protects the database, parent `AUDIT` schema, storage
-integration, S3 data, and AWS IAM resources. `prod`, if later configured,
-requires both `--yes` and `--allow-prod-destroy`.
+read-only monitoring script. For `destroy`, type `DEV` at the prompt or use
+`--yes`. The manager inspects `snow dcm purge --help` and `snow dcm drop --help`
+individually before removing any standalone resources. It requires both
+commands to document the project directory (`--from`), target, and connection.
+For non-interactive purge confirmation it supplies `--force` only when purge
+help documents it; otherwise it uses a documented `--yes` option or stops.
+
+Destroy suspends tasks leaf-to-root, removes standalone objects in reverse
+deployment order, runs DCM purge, and only then drops the DCM project. The
+summary reports **DCM purge completed**, **DCM project dropped**, and
+**Complete destruction completed** as separate milestones. Purge failure stops
+before drop. If purge reports the project is already absent, the manager does
+not count that as a successful purge because managed entities may remain. If
+drop fails after purge, it reports the partial teardown and does not report
+complete destruction. The DEV destroy policy permits deletion of the
+project-owned warehouse. It always protects the database, parent `AUDIT`
+schema, storage integration, S3 data, and AWS IAM resources. `prod`, if later
+configured, requires both `--yes` and `--allow-prod-destroy`.
 
 The current manifest defines only `DEV`. `staging` and `prod` are rejected
 until real manifest targets and complete configuration files exist. The
-manager probes the installed `snow dcm --help` for an explicitly documented
-teardown command before deleting anything. If that help does not expose a
-target-scoped DCM destroy/drop operation, destroy stops before removing
-standalone resources. The current development host had no Snowflake CLI
-installed, so actual DCM teardown support could not be confirmed here. See the
-[resource inventory](docs/resource-inventory.md) and
+current development host had no Snowflake CLI installed, so command options
+could not be checked locally; runtime help validation prevents guessed flags.
+See the [resource inventory](docs/resource-inventory.md) and
 [runbook](docs/runbook.md) for ownership, sequencing, and recovery details.
 
 ## Combined Phase 4-5 processing

@@ -64,9 +64,19 @@ those external notification rules.
 ## DCM teardown support
 
 The Snowflake CLI was not installed in the implementation environment, so its
-version and `snow dcm --help` could not be inspected here. The lifecycle manager
-checks the installed CLI's own DCM help at runtime. It only starts deletion if
-that help advertises a scoped `destroy`, `drop`, `delete`, or `remove` command
-and documents the target and connection options. If no such command is
-advertised, destroy stops before deleting standalone resources; it does not
-invent a DCM command or leave an avoidable half-destroyed project.
+version and command options could not be inspected here. At runtime, the
+lifecycle manager requires both `snow dcm purge` and `snow dcm drop`, and
+inspects each command's own help before any standalone deletion. Both help
+outputs must document the project directory (`--from`), target, and connection
+options. Purge help must document a non-interactive confirmation option:
+`--force` is passed only when explicitly documented; otherwise a documented
+`--yes` is used. Missing commands or required options stop destruction before
+standalone resources are removed.
+
+The order is standalone SQL teardown, DCM purge, then DCM drop. Purge removes
+managed entities, grants, and attachments; drop removes the project object and
+deployment history. Purge failure prevents drop. A missing project response
+from purge is not treated as proof that managed entities were removed. The
+lifecycle summary records purge, project drop, and complete destruction as
+separate milestones; a failed drop after successful purge is partial teardown,
+not complete destruction.

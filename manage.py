@@ -509,7 +509,9 @@ class LifecycleManager:
         self._sql_help = sql_help.stdout or ""
         if require_dcm:
             dcm_help = self._invoke(["dcm", "--help"], "Inspect snow dcm help")
-            self._dcm_help = dcm_help.stdout or ""
+            self._dcm_help = (dcm_help.stdout or "") + "\n" + (
+                dcm_help.stderr or ""
+            )
 
     def _dcm_args(self, command: str) -> list[str]:
         help_result = self._invoke(
@@ -615,14 +617,6 @@ class LifecycleManager:
         return "already exists" in lowered or "already created" in lowered
 
     @staticmethod
-    def _already_missing(output: str) -> bool:
-        lowered = output.lower()
-        return any(
-            marker in lowered
-            for marker in ("does not exist", "not found", "no such project")
-        )
-
-    @staticmethod
     def _plan_has_no_changes(output: str) -> bool:
         lowered = output.lower()
         return any(marker in lowered for marker in NO_CHANGE_MARKERS)
@@ -698,24 +692,97 @@ class LifecycleManager:
             "Monitor unified Phase 3-6C pipeline",
         )
 
-    def _dcm_destroy_command(self) -> list[str]:
+    def _dcm_destroy_command(self) -> tuple[list[str], list[str]]:
         available = set()
         for line in ANSI_PATTERN.sub("", self._dcm_help).splitlines():
             match = re.match(r"^\s{2,}([a-z][a-z-]+)\s{2,}", line)
             if match:
                 available.add(match.group(1))
-        verb = next(
-            (candidate for candidate in ("destroy", "drop", "delete", "remove")
-             if candidate in available),
+        missing_commands = {"purge", "drop"} - available
+        if missing_commands:
+            raise LifecycleError(
+                "The installed snow dcm --help must advertise both `purge` and "
+                f"`drop`; missing: {', '.join(sorted(missing_commands))}. "
+                "No project resources were deleted."
+            )
+
+        if not self.root.is_dir():
+            raise LifecycleError(
+                f"DCM project directory does not exist: {self.root}. "
+                "No project resources were deleted."
+            )
+
+        def command_help(command: str) -> str:
+            help_result = self._invoke(
+                ["dcm", command, "--help"],
+                f"Inspect snow dcm {command} help",
+                check=False,
+            )
+            if help_result.returncode != 0:
+                details = (
+                    help_result.stderr
+                    or help_result.stdout
+                    or f"exit code {help_result.returncode}"
+                ).strip()
+                raise LifecycleError(
+                    f"Could not inspect installed snow dcm {command} help: {details}. "
+                    "No project resources were deleted."
+                )
+            return (help_result.stdout or "") + "\n" + (
+                help_result.stderr or ""
+            )
+
+        def command_args(
+            command: str,
+            help_text: str,
+            confirmation_option: str | None = None,
+        ) -> list[str]:
+            required_options = ("--from", "--target", "--connection")
+            unsupported = [
+                option
+                for option in required_options
+                if not self._has_option(help_text, option)
+            ]
+            if unsupported:
+                raise LifecycleError(
+                    f"Installed snow dcm {command} help does not document required "
+                    f"options: {', '.join(unsupported)}. No project resources were "
+                    "deleted."
+                )
+            if command == "purge" and confirmation_option is None:
+                raise LifecycleError(
+                    "Installed snow dcm purge help must document a non-interactive "
+                    "`--force` or `--yes` confirmation option. No project resources "
+                    "were deleted."
+                )
+
+            args = [
+                "dcm",
+                command,
+                "--from",
+                ".",
+                "--target",
+                self.target.manifest_target,
+                "--connection",
+                self.target.connection_name,
+            ]
+            if confirmation_option:
+                args.append(confirmation_option)
+            return args
+
+        purge_help_text = command_help("purge")
+        drop_help_text = command_help("drop")
+        purge_confirmation = next(
+            (
+                option
+                for option in ("--force", "--yes")
+                if self._has_option(purge_help_text, option)
+            ),
             None,
         )
-        if verb is None:
-            raise LifecycleError(
-                "The installed snow dcm --help does not advertise a destroy/drop/"
-                "delete/remove command. No project resources were deleted; DCM-managed "
-                "resource teardown is not supported by the detected CLI."
-            )
-        return self._dcm_args(verb)
+        purge_args = command_args("purge", purge_help_text, purge_confirmation)
+        drop_args = command_args("drop", drop_help_text)
+        return purge_args, drop_args
 
     def _print_destroy_plan(self) -> None:
         self.output(f"Destroy plan for target {self.target.name} ({self.target.manifest_target})")
@@ -731,6 +798,14 @@ class LifecycleManager:
                 "Warehouse deletion is disabled by target policy; complete destroy "
                 "is blocked before any resource is removed."
             )
+
+    @staticmethod
+    def _dcm_project_is_missing(output: str) -> bool:
+        lowered = output.lower()
+        return "project" in lowered and any(
+            marker in lowered
+            for marker in ("does not exist", "not found", "no such")
+        )
 
     def destroy(
         self,
@@ -752,28 +827,57 @@ class LifecycleManager:
         )
         try:
             self._probe_cli(require_dcm=True)
-            dcm_destroy_args = self._dcm_destroy_command()
+            dcm_purge_args, dcm_drop_args = self._dcm_destroy_command()
             self._role_preflight()
             for label, script in DESTROY_SQL_SEQUENCE:
                 self._sql(script, label)
-            dcm_result = self._invoke(
-                dcm_destroy_args,
-                "Destroy DCM-managed resources",
+            purge_result = self._invoke(
+                dcm_purge_args,
+                "Purge DCM-managed resources",
                 check=False,
             )
-            if dcm_result.returncode == 0:
-                self.completed.append("Destroy DCM-managed resources")
-            elif self._already_missing(
-                (dcm_result.stdout or "") + (dcm_result.stderr or "")
-            ):
-                self.skipped.append("DCM resources/project already absent")
-            else:
+            purge_output = (purge_result.stdout or "") + (
+                purge_result.stderr or ""
+            )
+            if self._dcm_project_is_missing(purge_output):
+                self.skipped.append(
+                    "DCM project already absent; purge was not confirmed, and "
+                    "DCM-managed entities may remain"
+                )
+                raise LifecycleError(
+                    "The DCM project is already absent. Purge did not complete, so "
+                    "existing DCM-managed entities were not confirmed removed; "
+                    "complete destruction was not completed."
+                )
+            if purge_result.returncode != 0:
                 details = (
-                    dcm_result.stderr
-                    or dcm_result.stdout
-                    or f"exit code {dcm_result.returncode}"
+                    purge_result.stderr
+                    or purge_result.stdout
+                    or f"exit code {purge_result.returncode}"
                 ).strip()
-                raise LifecycleError(f"DCM destroy failed: {details}")
+                raise LifecycleError(
+                    f"DCM purge failed; DCM drop was not run: {details}"
+                )
+            self.completed.append("DCM purge completed")
+
+            drop_result = self._invoke(
+                dcm_drop_args,
+                "Drop DCM project",
+                check=False,
+            )
+            if drop_result.returncode != 0:
+                details = (
+                    drop_result.stderr
+                    or drop_result.stdout
+                    or f"exit code {drop_result.returncode}"
+                ).strip()
+                raise LifecycleError(
+                    "DCM purge completed, but DCM project drop failed. Managed "
+                    "entities were purged, but the DCM project object remains; "
+                    f"complete destruction was not completed. Details: {details}"
+                )
+            self.completed.append("DCM project dropped")
+            self.completed.append("Complete destruction completed")
             self._print_summary("Destruction summary")
         except LifecycleError:
             self._print_summary(

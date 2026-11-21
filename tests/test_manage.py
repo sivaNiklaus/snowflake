@@ -35,14 +35,22 @@ class MockSnow:
     def __init__(
         self,
         plan_output: str = "Plan contains changes.",
-        teardown: bool = True,
+        dcm_commands: tuple[str, ...] = ("create", "plan", "deploy", "purge", "drop"),
+        purge_options: str = (
+            "--from PATH\n--target TARGET\n--connection NAME\n--force"
+        ),
+        drop_options: str = "--from PATH\n--target TARGET\n--connection NAME",
         fail_script: str | None = None,
+        fail_dcm: str | None = None,
         existing_pipe: str | None = None,
-        missing_dcm_project: bool = False,
+        missing_dcm_project: str | None = None,
     ) -> None:
         self.plan_output = plan_output
-        self.teardown = teardown
+        self.dcm_commands = dcm_commands
+        self.purge_options = purge_options
+        self.drop_options = drop_options
         self.fail_script = fail_script
+        self.fail_dcm = fail_dcm
         self.existing_pipe = existing_pipe
         self.missing_dcm_project = missing_dcm_project
         self.calls: list[list[str]] = []
@@ -65,27 +73,32 @@ class MockSnow:
                 "Options:\n  --connection TEXT\n  --filename FILE",
             )
         if command == ["dcm", "--help"]:
-            commands = "  create  Create project\n  plan  Plan project\n  deploy  Deploy project\n"
-            if self.teardown:
-                commands += "  destroy  Remove deployed project resources\n"
+            commands = "\n".join(
+                f"  {verb}  {verb.title()} project resources"
+                for verb in self.dcm_commands
+            )
             return self._result(
                 args,
                 "Options:\n  --connection TEXT\nCommands:\n" + commands,
             )
         if len(command) == 3 and command[0] == "dcm" and command[2] == "--help":
             verb = command[1]
-            flags = "--target TARGET\n--connection NAME\n"
-            if verb in {"create", "plan", "deploy"}:
-                flags += "--from PATH\n"
-            elif verb == "destroy" and self.teardown:
-                flags += "--from PATH\n"
+            flags = {
+                "create": "--target TARGET\n--connection NAME\n--from PATH\n",
+                "plan": "--target TARGET\n--connection NAME\n--from PATH\n",
+                "deploy": "--target TARGET\n--connection NAME\n--from PATH\n",
+                "purge": self.purge_options,
+                "drop": self.drop_options,
+            }.get(verb, "")
             return self._result(args, f"Options:\n{flags}")
         if len(command) >= 2 and command[0] == "dcm":
             verb = command[1]
             if verb == "plan":
                 return self._result(args, self.plan_output)
-            if verb == "destroy" and self.missing_dcm_project:
-                return self._result(args, code=1, error="Project not found")
+            if verb == self.missing_dcm_project:
+                return self._result(args, code=1, error="DCM project not found")
+            if verb == self.fail_dcm:
+                return self._result(args, code=1, error=f"mock DCM {verb} failure")
             return self._result(args, f"{verb} complete")
         if command[:2] == ["sql", "--connection"]:
             if "--filename" not in command:
@@ -141,7 +154,7 @@ def dcm_actions(fake_snow: MockSnow) -> list[str]:
         for call in fake_snow.calls
         if len(call) > 2
         and call[1:2] == ["dcm"]
-        and call[2] in {"create", "plan", "deploy", "destroy"}
+        and call[2] in {"create", "plan", "deploy", "purge", "drop"}
         and call[-1] != "--help"
     ]
 
@@ -268,30 +281,87 @@ def test_existing_pipe_is_left_unchanged_and_deploy_continues(tmp_path: Path) ->
     assert manager.completed[-1] == "Suspend all pipeline tasks"
 
 
-def test_destroy_suspends_and_drops_in_reverse_dependency_order(tmp_path: Path) -> None:
+def test_destroy_orders_standalone_teardown_then_purge_then_drop(
+    tmp_path: Path,
+) -> None:
+    output: list[str] = []
     fake = MockSnow()
-    manager = make_manager(tmp_path, fake)
+    manager = make_manager(tmp_path, fake, output)
 
     manager.destroy(yes=True)
 
     expected_sql = [script for _, script in manage.DESTROY_SQL_SEQUENCE]
     assert sql_filenames(fake) == expected_sql
-    assert dcm_actions(fake) == ["destroy"]
-    assert manager.completed[-1] == "Destroy DCM-managed resources"
+    assert dcm_actions(fake) == ["purge", "drop"]
+    actual_operations = []
+    for call in fake.calls:
+        if call[:2] == ["snow", "dcm"] and call[2] in {"purge", "drop"}:
+            if call[-1] != "--help":
+                actual_operations.append(call[2])
+        elif call[:2] == ["snow", "sql"] and "--filename" in call:
+            filename = call[call.index("--filename") + 1].replace("\\", "/")
+            if "/skypoints-lifecycle-" not in filename:
+                actual_operations.append(filename)
+    assert actual_operations == expected_sql + ["purge", "drop"]
+    assert manager.completed[-3:] == [
+        "DCM purge completed",
+        "DCM project dropped",
+        "Complete destruction completed",
+    ]
+    purge_call = next(
+        call
+        for call in fake.calls
+        if call[1:3] == ["dcm", "purge"] and call[-1] != "--help"
+    )
+    assert "--force" in purge_call
+    assert "Complete destruction completed" in "\n".join(output)
 
 
-def test_destroy_refuses_before_deletion_when_dcm_help_lacks_teardown(
+@pytest.mark.parametrize("missing_command", ["purge", "drop"])
+def test_destroy_requires_both_dcm_commands_before_standalone_deletion(
     tmp_path: Path,
+    missing_command: str,
 ) -> None:
     output: list[str] = []
-    fake = MockSnow(teardown=False)
+    commands = tuple(
+        command
+        for command in ("create", "plan", "deploy", "purge", "drop")
+        if command != missing_command
+    )
+    fake = MockSnow(dcm_commands=commands)
     manager = make_manager(tmp_path, fake, output)
 
-    with pytest.raises(manage.LifecycleError, match="does not advertise"):
+    with pytest.raises(manage.LifecycleError, match="must advertise both"):
         manager.destroy(yes=True)
 
     assert sql_filenames(fake) == []
     assert "Always protected:" in "\n".join(output)
+
+
+@pytest.mark.parametrize(
+    ("command", "options"),
+    [
+        ("purge", "--target TARGET\n--connection NAME\n--force"),
+        ("purge", "--from PATH\n--connection NAME\n--force"),
+        ("purge", "--from PATH\n--target TARGET\n--force"),
+        ("drop", "--target TARGET\n--connection NAME"),
+        ("drop", "--from PATH\n--connection NAME"),
+        ("drop", "--from PATH\n--target TARGET"),
+    ],
+)
+def test_destroy_requires_documented_target_connection_and_project_directory(
+    tmp_path: Path,
+    command: str,
+    options: str,
+) -> None:
+    fake = MockSnow(**{f"{command}_options": options})
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="does not document required"):
+        manager.destroy(yes=True)
+
+    assert sql_filenames(fake) == []
+    assert dcm_actions(fake) == []
 
 
 def test_destroy_stops_on_failure_and_does_not_run_later_phases(tmp_path: Path) -> None:
@@ -311,13 +381,88 @@ def test_destroy_stops_on_failure_and_does_not_run_later_phases(tmp_path: Path) 
     assert dcm_actions(fake) == []
 
 
-def test_missing_dcm_project_is_a_safe_destroy_skip(tmp_path: Path) -> None:
-    fake = MockSnow(missing_dcm_project=True)
+def test_purge_failure_prevents_dcm_drop(tmp_path: Path) -> None:
+    fake = MockSnow(fail_dcm="purge")
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="DCM purge failed"):
+        manager.destroy(yes=True)
+
+    assert dcm_actions(fake) == ["purge"]
+    assert "DCM purge completed" not in manager.completed
+    assert "Complete destruction completed" not in manager.completed
+
+
+def test_drop_failure_reports_purge_complete_but_project_remaining(
+    tmp_path: Path,
+) -> None:
+    output: list[str] = []
+    fake = MockSnow(fail_dcm="drop")
+    manager = make_manager(tmp_path, fake, output)
+
+    with pytest.raises(manage.LifecycleError, match="project object remains"):
+        manager.destroy(yes=True)
+
+    assert dcm_actions(fake) == ["purge", "drop"]
+    assert "DCM purge completed" in manager.completed
+    assert "DCM project dropped" not in manager.completed
+    assert "Complete destruction completed" not in manager.completed
+    assert "DCM purge completed" in "\n".join(output)
+
+
+def test_missing_dcm_project_does_not_count_as_successful_purge(
+    tmp_path: Path,
+) -> None:
+    fake = MockSnow(missing_dcm_project="purge")
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="project is already absent"):
+        manager.destroy(yes=True)
+
+    assert dcm_actions(fake) == ["purge"]
+    assert any("purge was not confirmed" in item for item in manager.skipped)
+    assert "DCM purge completed" not in manager.completed
+    assert "Complete destruction completed" not in manager.completed
+
+
+def test_purge_force_flag_is_used_only_when_documented(
+    tmp_path: Path,
+) -> None:
+    fake = MockSnow(
+        purge_options="--from PATH\n--target TARGET\n--connection NAME\n--yes"
+    )
     manager = make_manager(tmp_path, fake)
 
     manager.destroy(yes=True)
 
-    assert "DCM resources/project already absent" in manager.skipped
+    purge_call = next(
+        call
+        for call in fake.calls
+        if call[1:3] == ["dcm", "purge"] and call[-1] != "--help"
+    )
+    drop_call = next(
+        call
+        for call in fake.calls
+        if call[1:3] == ["dcm", "drop"] and call[-1] != "--help"
+    )
+    assert "--yes" in purge_call
+    assert "--force" not in purge_call
+    assert "--force" not in drop_call
+
+
+def test_purge_requires_documented_noninteractive_confirmation_before_deletion(
+    tmp_path: Path,
+) -> None:
+    fake = MockSnow(
+        purge_options="--from PATH\n--target TARGET\n--connection NAME"
+    )
+    manager = make_manager(tmp_path, fake)
+
+    with pytest.raises(manage.LifecycleError, match="non-interactive"):
+        manager.destroy(yes=True)
+
+    assert sql_filenames(fake) == []
+    assert dcm_actions(fake) == []
 
 
 def test_destroy_respects_target_warehouse_policy_before_cli_invocation(
