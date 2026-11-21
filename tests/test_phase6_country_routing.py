@@ -87,12 +87,18 @@ def test_country_tables_are_created_lazily_from_member_current_schema() -> None:
     )
 
 
-def test_routing_loop_results_have_explicit_member_country_fields() -> None:
-    assert ROUTING_DEPLOYMENT.count("config.COUNTRY_CODE AS COUNTRY_CODE") >= 2
-    assert ROUTING_DEPLOYMENT.count("config.TARGET_TABLE AS TARGET_TABLE") >= 2
-    assert "COUNTRY_CODE AS COUNTRY_CODE, TARGET_TABLE AS TARGET_TABLE" in ROUTING_DEPLOYMENT
-    assert "v_country_code := route_country.COUNTRY_CODE" in ROUTING_DEPLOYMENT
-    assert "v_country_code := configured_country.COUNTRY_CODE" in ROUTING_DEPLOYMENT
+def test_routing_iterates_cursors_without_record_field_dereferences() -> None:
+    assert "c_active_route_countries CURSOR FOR" in ROUTING_DEPLOYMENT
+    assert "c_configured_countries CURSOR FOR" in ROUTING_DEPLOYMENT
+    assert ROUTING_DEPLOYMENT.count(
+        "FETCH c_active_route_countries INTO v_country_code, v_target_table"
+    ) == 4
+    assert ROUTING_DEPLOYMENT.count(
+        "FETCH c_configured_countries INTO v_country_code, v_target_table"
+    ) == 2
+    assert ROUTING_DEPLOYMENT.count("WHILE (v_country_code IS NOT NULL) DO") == 3
+    assert "route_country.COUNTRY_CODE" not in ROUTING_DEPLOYMENT
+    assert "configured_country.COUNTRY_CODE" not in ROUTING_DEPLOYMENT
 
 
 def test_country_merge_columns_match_existing_member_current_definition() -> None:

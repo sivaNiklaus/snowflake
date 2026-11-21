@@ -83,6 +83,31 @@ DECLARE
     v_country_updates NUMBER(38, 0) DEFAULT 0;
     v_country_removals NUMBER(38, 0) DEFAULT 0;
     v_transaction_started BOOLEAN DEFAULT FALSE;
+    c_active_route_countries CURSOR FOR
+        SELECT
+            config.COUNTRY_CODE AS COUNTRY_CODE,
+            config.TARGET_TABLE AS TARGET_TABLE
+        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
+        JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
+          ON decisions.NORMALIZED_COUNTRY = config.COUNTRY_CODE
+         AND decisions.FAILURE_REASON IS NULL
+        WHERE config.IS_ACTIVE
+          AND config.COUNTRY_CODE IN
+          (
+            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
+            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
+          )
+          AND config.TARGET_TABLE = 'MEMBER_' || config.COUNTRY_CODE
+        GROUP BY config.COUNTRY_CODE, config.TARGET_TABLE;
+    c_configured_countries CURSOR FOR
+        SELECT COUNTRY_CODE, TARGET_TABLE
+        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
+        WHERE COUNTRY_CODE IN
+        (
+            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
+            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
+        )
+          AND TARGET_TABLE = 'MEMBER_' || COUNTRY_CODE;
 BEGIN
     SELECT COALESCE(
         SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID'),
@@ -282,57 +307,23 @@ BEGIN
     );
 
     -- Create only tables for active, allowlisted countries with current members.
-    FOR route_country IN
-    (
-        SELECT
-            config.COUNTRY_CODE AS COUNTRY_CODE,
-            config.TARGET_TABLE AS TARGET_TABLE
-        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
-        JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
-          ON decisions.NORMALIZED_COUNTRY = config.COUNTRY_CODE
-         AND decisions.FAILURE_REASON IS NULL
-        WHERE config.IS_ACTIVE
-          AND config.COUNTRY_CODE IN
-          (
-            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-          )
-          AND config.TARGET_TABLE = 'MEMBER_' || config.COUNTRY_CODE
-        GROUP BY config.COUNTRY_CODE, config.TARGET_TABLE
-    )
-    DO
-        v_country_code := route_country.COUNTRY_CODE;
-        v_target_table := route_country.TARGET_TABLE;
+    OPEN c_active_route_countries;
+    FETCH c_active_route_countries INTO v_country_code, v_target_table;
+    WHILE (v_country_code IS NOT NULL) DO
         v_target_fqn := 'SKYPOINTS_DB.CORE.' || v_target_table;
 
         CREATE TABLE IF NOT EXISTS IDENTIFIER(:v_target_fqn)
             LIKE SKYPOINTS_DB.CORE.MEMBER_CURRENT;
-    END FOR;
+        FETCH c_active_route_countries INTO v_country_code, v_target_table;
+    END WHILE;
+    CLOSE c_active_route_countries;
 
     BEGIN TRANSACTION;
     v_transaction_started := TRUE;
 
-    FOR route_country IN
-    (
-        SELECT
-            config.COUNTRY_CODE AS COUNTRY_CODE,
-            config.TARGET_TABLE AS TARGET_TABLE
-        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
-        JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
-          ON decisions.NORMALIZED_COUNTRY = config.COUNTRY_CODE
-         AND decisions.FAILURE_REASON IS NULL
-        WHERE config.IS_ACTIVE
-          AND config.COUNTRY_CODE IN
-          (
-            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-          )
-          AND config.TARGET_TABLE = 'MEMBER_' || config.COUNTRY_CODE
-        GROUP BY config.COUNTRY_CODE, config.TARGET_TABLE
-    )
-    DO
-        v_country_code := route_country.COUNTRY_CODE;
-        v_target_table := route_country.TARGET_TABLE;
+    OPEN c_active_route_countries;
+    FETCH c_active_route_countries INTO v_country_code, v_target_table;
+    WHILE (v_country_code IS NOT NULL) DO
         v_target_fqn := 'SKYPOINTS_DB.CORE.' || v_target_table;
 
         SELECT COUNT(*)
@@ -445,24 +436,15 @@ BEGIN
         v_routed_members := v_routed_members + v_country_members;
         v_inserted_count := v_inserted_count + v_country_inserts;
         v_updated_count := v_updated_count + v_country_updates;
-    END FOR;
+        FETCH c_active_route_countries INTO v_country_code, v_target_table;
+    END WHILE;
+    CLOSE c_active_route_countries;
 
     -- All valid destinations are merged before stale country rows are removed.
     -- Both operations share this transaction, so merge failures preserve old rows.
-    FOR configured_country IN
-    (
-        SELECT COUNTRY_CODE AS COUNTRY_CODE, TARGET_TABLE AS TARGET_TABLE
-        FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
-        WHERE COUNTRY_CODE IN
-        (
-            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-        )
-          AND TARGET_TABLE = 'MEMBER_' || COUNTRY_CODE
-    )
-    DO
-        v_country_code := configured_country.COUNTRY_CODE;
-        v_target_table := configured_country.TARGET_TABLE;
+    OPEN c_configured_countries;
+    FETCH c_configured_countries INTO v_country_code, v_target_table;
+    WHILE (v_country_code IS NOT NULL) DO
         v_target_fqn := 'SKYPOINTS_DB.CORE.' || v_target_table;
 
         SELECT COUNT(*)
@@ -499,7 +481,9 @@ BEGIN
 
             v_removed_count := v_removed_count + v_country_removals;
         END IF;
-    END FOR;
+        FETCH c_configured_countries INTO v_country_code, v_target_table;
+    END WHILE;
+    CLOSE c_configured_countries;
 
     COMMIT;
     v_transaction_started := FALSE;
