@@ -140,21 +140,15 @@ def test_copy_result_scan_extracts_columns_without_case_sensitive_identifiers() 
     assert '"file"' not in DEPLOYMENT
 
 
-def test_audit_inserts_use_select_for_scripting_bind_variables() -> None:
-    insert_modes = re.findall(
-        r"INSERT INTO SKYPOINTS_DB\.AUDIT\.INGESTION_AUDIT\s*"
-        r"\([^)]*\)\s*(SELECT|VALUES)\b",
-        DEPLOYMENT,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    assert insert_modes == ["SELECT", "SELECT", "SELECT"]
+def test_ingestion_audit_upserts_are_idempotent_for_graph_retries() -> None:
+    assert DEPLOYMENT.count(
+        "MERGE INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT AS target"
+    ) == 3
+    assert DEPLOYMENT.count("ON target.RUN_ID = source.RUN_ID") == 3
+    assert DEPLOYMENT.count("AND target.TASK_NAME = source.TASK_NAME") == 3
+    assert DEPLOYMENT.count("WHEN NOT MATCHED THEN INSERT") == 3
     assert "PARSE_JSON(" not in DEPLOYMENT.upper()
-    assert not re.search(
-        r"INSERT\s+INTO\b.*?\bVALUES\s*\(",
-        DEPLOYMENT,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    assert DEPLOYMENT.count(":v_source_files;") == 2
+    assert "SOURCE_FILES = :v_source_files" in DEPLOYMENT
 
 
 def test_validation_fails_for_empty_member_table() -> None:

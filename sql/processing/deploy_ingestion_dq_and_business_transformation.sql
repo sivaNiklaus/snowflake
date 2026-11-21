@@ -15,6 +15,25 @@ CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
 )
 COMMENT = 'Run-level audit for combined Phase 4-5 parsing, DQ, and processing';
 
+CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS
+(
+    DATASET_NAME VARCHAR NOT NULL,
+    SOURCE_FILENAME VARCHAR NOT NULL,
+    SOURCE_FILE_CONTENT_KEY VARCHAR NOT NULL,
+    STAGE_NAME VARCHAR NOT NULL,
+    RUN_ID VARCHAR NOT NULL,
+    STATUS VARCHAR NOT NULL,
+    ROWS_PROCESSED NUMBER(38, 0) NOT NULL DEFAULT 0,
+    STARTED_AT TIMESTAMP_LTZ NOT NULL,
+    ENDED_AT TIMESTAMP_LTZ,
+    ERROR_DETAILS VARCHAR,
+    PRIMARY KEY
+    (
+        DATASET_NAME, SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, STAGE_NAME
+    )
+)
+COMMENT = 'Per-source-file downstream checkpoints; only SUCCEEDED stages advance watermarks';
+
 CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.DQ_RULE_MASTER
 (
     RULE_ID VARCHAR NOT NULL,
@@ -273,6 +292,8 @@ DECLARE
     v_rows_processed NUMBER(38, 0) DEFAULT 0;
     v_member_rows NUMBER(38, 0) DEFAULT 0;
     v_redemption_rows NUMBER(38, 0) DEFAULT 0;
+    v_member_file_count NUMBER(38, 0) DEFAULT 0;
+    v_redemption_file_count NUMBER(38, 0) DEFAULT 0;
 BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
@@ -287,6 +308,68 @@ BEGIN
         (RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_PROCESSED)
     VALUES
         (source.RUN_ID, source.TASK_NAME, :v_started_at, 'STARTED', 0);
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES AS
+    SELECT DISTINCT raw.SOURCE_FILENAME, raw.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW AS raw
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'MEMBER'
+          AND checkpoint.SOURCE_FILENAME = raw.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = raw.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'PARSE'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES AS
+    SELECT DISTINCT raw.SOURCE_FILENAME, raw.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.RAW.REDEMPTION_RAW AS raw
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'REDEMPTION'
+          AND checkpoint.SOURCE_FILENAME = raw.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = raw.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'PARSE'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    SELECT COUNT(*) INTO :v_member_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES;
+    SELECT COUNT(*) INTO :v_redemption_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, SOURCE_FILENAME,
+               SOURCE_FILE_CONTENT_KEY, 'PARSE' AS STAGE_NAME
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES
+        UNION ALL
+        SELECT 'REDEMPTION', SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, 'PARSE'
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        RUN_ID = :v_run_id, STATUS = 'STARTED', ROWS_PROCESSED = 0,
+        STARTED_AT = CURRENT_TIMESTAMP(), ENDED_AT = NULL, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        DATASET_NAME, SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, STAGE_NAME,
+        RUN_ID, STATUS, ROWS_PROCESSED, STARTED_AT
+    )
+    VALUES
+    (
+        source.DATASET_NAME, source.SOURCE_FILENAME,
+        source.SOURCE_FILE_CONTENT_KEY, source.STAGE_NAME,
+        :v_run_id, 'STARTED', 0, CURRENT_TIMESTAMP()
+    );
 
     MERGE INTO SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS target
     USING
@@ -316,6 +399,14 @@ BEGIN
             SOURCE_FILENAME, SOURCE_ROW_NUMBER, SOURCE_FILE_CONTENT_KEY,
             INGESTED_AT, SOURCE_RECORD
         FROM SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES AS pending
+            WHERE pending.SOURCE_FILENAME = MEMBER_PROFILE_RAW.SOURCE_FILENAME
+              AND pending.SOURCE_FILE_CONTENT_KEY =
+                  MEMBER_PROFILE_RAW.SOURCE_FILE_CONTENT_KEY
+        )
         QUALIFY ROW_NUMBER() OVER
         (
             PARTITION BY SOURCE_FILENAME, SOURCE_ROW_NUMBER, SOURCE_FILE_CONTENT_KEY
@@ -388,6 +479,13 @@ BEGIN
             raw.PAYLOAD AS ORIGINAL_PAYLOAD
         FROM SKYPOINTS_DB.RAW.REDEMPTION_RAW AS raw,
              LATERAL FLATTEN(INPUT => raw.PAYLOAD:redemptions) AS flattened
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES AS pending
+            WHERE pending.SOURCE_FILENAME = raw.SOURCE_FILENAME
+              AND pending.SOURCE_FILE_CONTENT_KEY = raw.SOURCE_FILE_CONTENT_KEY
+        )
         QUALIFY ROW_NUMBER() OVER
         (
             PARTITION BY raw.SOURCE_FILENAME, raw.SOURCE_ROW_NUMBER,
@@ -429,22 +527,75 @@ BEGIN
 
     SELECT COUNT(*)
       INTO :v_member_rows
-      FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED;
+      FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+     WHERE EXISTS
+     (
+         SELECT 1
+         FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES AS pending
+         WHERE pending.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+           AND pending.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+     );
 
     SELECT COUNT(*)
       INTO :v_redemption_rows
-      FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED;
+      FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+     WHERE EXISTS
+     (
+         SELECT 1
+         FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES AS pending
+         WHERE pending.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+           AND pending.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+     );
 
     v_rows_processed := v_member_rows + v_redemption_rows;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY, 'PARSE' AS STAGE_NAME,
+               COUNT(parsed.RECORD_KEY) AS ROWS_PROCESSED
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PARSE_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+        UNION ALL
+        SELECT 'REDEMPTION', pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY, 'PARSE',
+               COUNT(parsed.RECORD_KEY)
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PARSE_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STATUS = 'SUCCEEDED', ROWS_PROCESSED = source.ROWS_PROCESSED,
+        ENDED_AT = CURRENT_TIMESTAMP(), ERROR_DETAILS = NULL;
 
     UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'SUCCEEDED',
            ROWS_PROCESSED = :v_rows_processed
      WHERE RUN_ID = :v_run_id AND TASK_NAME = 'TASK_PARSE_AND_NORMALIZE';
 
-    RETURN OBJECT_CONSTRUCT('run_id', v_run_id, 'rows_processed', v_rows_processed);
+    RETURN OBJECT_CONSTRUCT(
+        'run_id', v_run_id,
+        'rows_processed', v_rows_processed,
+        'member_files_processed', v_member_file_count,
+        'redemption_files_processed', v_redemption_file_count
+    );
 EXCEPTION
     WHEN OTHER THEN
+        UPDATE SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS
+           SET STATUS = 'FAILED', ENDED_AT = CURRENT_TIMESTAMP(),
+               ERROR_DETAILS = :SQLERRM
+         WHERE RUN_ID = :v_run_id AND STAGE_NAME = 'PARSE'
+           AND STATUS = 'STARTED';
         UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
            SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'FAILED',
                ERROR_DETAILS = :SQLERRM
@@ -474,6 +625,8 @@ DECLARE
     v_redemption_valid NUMBER(38, 0) DEFAULT 0;
     v_redemption_invalid NUMBER(38, 0) DEFAULT 0;
     v_redemption_duplicates NUMBER(38, 0) DEFAULT 0;
+    v_member_file_count NUMBER(38, 0) DEFAULT 0;
+    v_redemption_file_count NUMBER(38, 0) DEFAULT 0;
 BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
@@ -488,6 +641,88 @@ BEGIN
         (RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_PROCESSED)
     VALUES
         (source.RUN_ID, source.TASK_NAME, :v_started_at, 'STARTED', 0);
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS
+    SELECT DISTINCT parsed.SOURCE_FILENAME, parsed.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'MEMBER'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'DQ'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    )
+    OR NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'MEMBER'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'MEMBER_PROCESSING'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS
+    SELECT DISTINCT parsed.SOURCE_FILENAME, parsed.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'REDEMPTION'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'DQ'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    )
+    OR NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'REDEMPTION'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'REDEMPTION_PROCESSING'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    SELECT COUNT(*) INTO :v_member_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES;
+    SELECT COUNT(*) INTO :v_redemption_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, SOURCE_FILENAME,
+               SOURCE_FILE_CONTENT_KEY, 'DQ' AS STAGE_NAME
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES
+        UNION ALL
+        SELECT 'REDEMPTION', SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, 'DQ'
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        RUN_ID = :v_run_id, STATUS = 'STARTED', ROWS_PROCESSED = 0,
+        STARTED_AT = CURRENT_TIMESTAMP(), ENDED_AT = NULL, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        DATASET_NAME, SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, STAGE_NAME,
+        RUN_ID, STATUS, ROWS_PROCESSED, STARTED_AT
+    )
+    VALUES
+    (
+        source.DATASET_NAME, source.SOURCE_FILENAME,
+        source.SOURCE_FILE_CONTENT_KEY, source.STAGE_NAME,
+        :v_run_id, 'STARTED', 0, CURRENT_TIMESTAMP()
+    );
 
     MERGE INTO SKYPOINTS_DB.AUDIT.DQ_EXECUTION AS target
     USING
@@ -582,6 +817,14 @@ BEGIN
         WHERE rule.DATASET_NAME = 'MEMBER'
           AND rule.IS_ENABLED
           AND COALESCE(member.MEMBER_RECORD_TYPE, '') <> 'H'
+          AND EXISTS
+          (
+              SELECT 1
+              FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending
+              WHERE pending.SOURCE_FILENAME = member.SOURCE_FILENAME
+                AND pending.SOURCE_FILE_CONTENT_KEY =
+                    member.SOURCE_FILE_CONTENT_KEY
+          )
     ) AS source
        ON target.RUN_ID = source.RUN_ID
       AND target.DATASET_NAME = source.DATASET_NAME
@@ -647,6 +890,15 @@ BEGIN
                             FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS incoming
                             WHERE incoming.MEMBER_RECORD_TYPE = 'D'
                               AND incoming.MEMBER_ID = redemption.MEMBER_ID
+                              AND EXISTS
+                              (
+                                  SELECT 1
+                                  FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending_member
+                                  WHERE pending_member.SOURCE_FILENAME =
+                                        incoming.SOURCE_FILENAME
+                                    AND pending_member.SOURCE_FILE_CONTENT_KEY =
+                                        incoming.SOURCE_FILE_CONTENT_KEY
+                              )
                               AND NOT EXISTS
                               (
                                   SELECT 1
@@ -687,6 +939,15 @@ BEGIN
                             FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS incoming
                             WHERE incoming.MEMBER_RECORD_TYPE = 'D'
                               AND incoming.MEMBER_ID = redemption.MEMBER_ID
+                              AND EXISTS
+                              (
+                                  SELECT 1
+                                  FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending_member
+                                  WHERE pending_member.SOURCE_FILENAME =
+                                        incoming.SOURCE_FILENAME
+                                    AND pending_member.SOURCE_FILE_CONTENT_KEY =
+                                        incoming.SOURCE_FILE_CONTENT_KEY
+                              )
                               AND NOT EXISTS
                               (
                                   SELECT 1
@@ -707,6 +968,14 @@ BEGIN
         CROSS JOIN SKYPOINTS_DB.AUDIT.DQ_RULE_MASTER AS rule
         WHERE rule.DATASET_NAME = 'REDEMPTION'
           AND rule.IS_ENABLED
+          AND EXISTS
+          (
+              SELECT 1
+              FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS pending
+              WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+                AND pending.SOURCE_FILE_CONTENT_KEY =
+                    redemption.SOURCE_FILE_CONTENT_KEY
+          )
     ) AS source
        ON target.RUN_ID = source.RUN_ID
       AND target.DATASET_NAME = source.DATASET_NAME
@@ -756,6 +1025,13 @@ BEGIN
          AND result.RUN_ID = :v_run_id
          AND result.DATASET_NAME = 'MEMBER'
          AND result.STATUS = 'FAILED'
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending
+            WHERE pending.SOURCE_FILENAME = member.SOURCE_FILENAME
+              AND pending.SOURCE_FILE_CONTENT_KEY = member.SOURCE_FILE_CONTENT_KEY
+        )
         GROUP BY member.RECORD_KEY, member.SOURCE_FILENAME,
                  member.SOURCE_ROW_NUMBER, member.SOURCE_FILE_CONTENT_KEY,
                  member.SOURCE_RECORD
@@ -800,6 +1076,14 @@ BEGIN
          AND result.RUN_ID = :v_run_id
          AND result.DATASET_NAME = 'REDEMPTION'
          AND result.STATUS = 'FAILED'
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS pending
+            WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+              AND pending.SOURCE_FILE_CONTENT_KEY =
+                  redemption.SOURCE_FILE_CONTENT_KEY
+        )
         GROUP BY redemption.RECORD_KEY, redemption.SOURCE_FILENAME,
                  redemption.SOURCE_ROW_NUMBER, redemption.SOURCE_FILE_CONTENT_KEY,
                  redemption.ORIGINAL_PAYLOAD, redemption.TRANSACTION_INDEX
@@ -837,6 +1121,14 @@ BEGIN
            AND result.DATASET_NAME = 'MEMBER'
            AND result.RECORD_KEY = member.RECORD_KEY
           WHERE COALESCE(member.MEMBER_RECORD_TYPE, '') <> 'H'
+            AND EXISTS
+            (
+                SELECT 1
+                FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending
+                WHERE pending.SOURCE_FILENAME = member.SOURCE_FILENAME
+                  AND pending.SOURCE_FILE_CONTENT_KEY =
+                      member.SOURCE_FILE_CONTENT_KEY
+            )
           GROUP BY member.RECORD_KEY
       ) AS member_failures;
 
@@ -847,6 +1139,15 @@ BEGIN
           SELECT GREATEST(COUNT(*) - 1, 0) AS duplicate_rows
           FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED
           WHERE MEMBER_RECORD_TYPE = 'D' AND MEMBER_ID IS NOT NULL
+            AND EXISTS
+            (
+                SELECT 1
+                FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending
+                WHERE pending.SOURCE_FILENAME =
+                      MEMBER_PROFILE_PARSED.SOURCE_FILENAME
+                  AND pending.SOURCE_FILE_CONTENT_KEY =
+                      MEMBER_PROFILE_PARSED.SOURCE_FILE_CONTENT_KEY
+            )
           GROUP BY MEMBER_ID
       ) AS member_duplicate_groups;
 
@@ -875,6 +1176,14 @@ BEGIN
             ON result.RUN_ID = :v_run_id
            AND result.DATASET_NAME = 'REDEMPTION'
            AND result.RECORD_KEY = redemption.RECORD_KEY
+          WHERE EXISTS
+          (
+              SELECT 1
+              FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS pending
+              WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+                AND pending.SOURCE_FILE_CONTENT_KEY =
+                    redemption.SOURCE_FILE_CONTENT_KEY
+          )
           GROUP BY redemption.RECORD_KEY
       ) AS redemption_failures;
 
@@ -885,6 +1194,15 @@ BEGIN
           SELECT GREATEST(COUNT(*) - 1, 0) AS duplicate_rows
           FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED
           WHERE REDEMPTION_ID IS NOT NULL
+            AND EXISTS
+            (
+                SELECT 1
+                FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS pending
+                WHERE pending.SOURCE_FILENAME =
+                      REDEMPTION_PARSED.SOURCE_FILENAME
+                  AND pending.SOURCE_FILE_CONTENT_KEY =
+                      REDEMPTION_PARSED.SOURCE_FILE_CONTENT_KEY
+            )
           GROUP BY REDEMPTION_ID
       ) AS redemption_duplicate_groups;
 
@@ -901,6 +1219,35 @@ BEGIN
         DUPLICATE_COUNT = :v_redemption_duplicates, ERROR_DETAILS = NULL;
 
     v_rows_processed := v_member_total + v_redemption_total;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY, 'DQ' AS STAGE_NAME,
+               COUNT(parsed.RECORD_KEY) AS ROWS_PROCESSED
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_DQ_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+        UNION ALL
+        SELECT 'REDEMPTION', pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY, 'DQ', COUNT(parsed.RECORD_KEY)
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_DQ_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STATUS = 'SUCCEEDED', ROWS_PROCESSED = source.ROWS_PROCESSED,
+        ENDED_AT = CURRENT_TIMESTAMP(), ERROR_DETAILS = NULL;
+
     UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'SUCCEEDED',
            ROWS_PROCESSED = :v_rows_processed
@@ -909,10 +1256,17 @@ BEGIN
     RETURN OBJECT_CONSTRUCT(
         'run_id', v_run_id,
         'member_invalid_records', v_member_invalid,
-        'redemption_invalid_records', v_redemption_invalid
+        'redemption_invalid_records', v_redemption_invalid,
+        'member_files_processed', v_member_file_count,
+        'redemption_files_processed', v_redemption_file_count
     );
 EXCEPTION
     WHEN OTHER THEN
+        UPDATE SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS
+           SET STATUS = 'FAILED', ENDED_AT = CURRENT_TIMESTAMP(),
+               ERROR_DETAILS = :SQLERRM
+         WHERE RUN_ID = :v_run_id AND STAGE_NAME = 'DQ'
+           AND STATUS = 'STARTED';
         UPDATE SKYPOINTS_DB.AUDIT.DQ_EXECUTION
            SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'FAILED',
                ERROR_DETAILS = :SQLERRM
@@ -936,6 +1290,7 @@ DECLARE
     v_started_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_processed_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_rows_processed NUMBER(38, 0) DEFAULT 0;
+    v_file_count NUMBER(38, 0) DEFAULT 0;
     v_transaction_started BOOLEAN DEFAULT FALSE;
 BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
@@ -951,6 +1306,49 @@ BEGIN
         (RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_PROCESSED)
     VALUES
         (source.RUN_ID, source.TASK_NAME, :v_started_at, 'STARTED', 0);
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_MEMBER_PROCESSING_FILES AS
+    SELECT DISTINCT parsed.SOURCE_FILENAME, parsed.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'MEMBER'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'MEMBER_PROCESSING'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    SELECT COUNT(*) INTO :v_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PROCESSING_FILES;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, SOURCE_FILENAME,
+               SOURCE_FILE_CONTENT_KEY, 'MEMBER_PROCESSING' AS STAGE_NAME
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PROCESSING_FILES
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        RUN_ID = :v_run_id, STATUS = 'STARTED', ROWS_PROCESSED = 0,
+        STARTED_AT = CURRENT_TIMESTAMP(), ENDED_AT = NULL, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        DATASET_NAME, SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, STAGE_NAME,
+        RUN_ID, STATUS, ROWS_PROCESSED, STARTED_AT
+    )
+    VALUES
+    (
+        source.DATASET_NAME, source.SOURCE_FILENAME,
+        source.SOURCE_FILE_CONTENT_KEY, source.STAGE_NAME,
+        :v_run_id, 'STARTED', 0, CURRENT_TIMESTAMP()
+    );
 
     CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.MEMBER_WINNERS AS
     SELECT
@@ -985,6 +1383,14 @@ BEGIN
             AND failed_rule.DATASET_NAME = 'MEMBER'
             AND failed_rule.RECORD_KEY = member.RECORD_KEY
             AND failed_rule.STATUS = 'FAILED'
+      )
+      AND EXISTS
+      (
+          SELECT 1
+          FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PROCESSING_FILES AS pending
+          WHERE pending.SOURCE_FILENAME = member.SOURCE_FILENAME
+            AND pending.SOURCE_FILE_CONTENT_KEY =
+                member.SOURCE_FILE_CONTENT_KEY
       )
     QUALIFY ROW_NUMBER() OVER
     (
@@ -1111,17 +1517,47 @@ BEGIN
     COMMIT;
     v_transaction_started := FALSE;
 
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'MEMBER' AS DATASET_NAME, pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY,
+               'MEMBER_PROCESSING' AS STAGE_NAME,
+               COUNT(parsed.RECORD_KEY) AS ROWS_PROCESSED
+        FROM SKYPOINTS_DB.STAGING.PENDING_MEMBER_PROCESSING_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.MEMBER_PROFILE_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STATUS = 'SUCCEEDED', ROWS_PROCESSED = source.ROWS_PROCESSED,
+        ENDED_AT = CURRENT_TIMESTAMP(), ERROR_DETAILS = NULL;
+
     UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'SUCCEEDED',
            ROWS_PROCESSED = :v_rows_processed
      WHERE RUN_ID = :v_run_id AND TASK_NAME = 'TASK_MEMBER_PROCESSING';
 
-    RETURN OBJECT_CONSTRUCT('run_id', v_run_id, 'members_processed', v_rows_processed);
+    RETURN OBJECT_CONSTRUCT(
+        'run_id', v_run_id,
+        'members_processed', v_rows_processed,
+        'files_processed', v_file_count
+    );
 EXCEPTION
     WHEN OTHER THEN
         IF (v_transaction_started) THEN
             ROLLBACK;
         END IF;
+        UPDATE SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS
+           SET STATUS = 'FAILED', ENDED_AT = CURRENT_TIMESTAMP(),
+               ERROR_DETAILS = :SQLERRM
+         WHERE RUN_ID = :v_run_id AND STAGE_NAME = 'MEMBER_PROCESSING'
+           AND STATUS = 'STARTED';
         UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
            SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'FAILED',
                ERROR_DETAILS = :SQLERRM
@@ -1141,6 +1577,7 @@ DECLARE
     v_started_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_processed_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_rows_processed NUMBER(38, 0) DEFAULT 0;
+    v_file_count NUMBER(38, 0) DEFAULT 0;
 BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
@@ -1155,6 +1592,50 @@ BEGIN
         (RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_PROCESSED)
     VALUES
         (source.RUN_ID, source.TASK_NAME, :v_started_at, 'STARTED', 0);
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES AS
+    SELECT DISTINCT parsed.SOURCE_FILENAME, parsed.SOURCE_FILE_CONTENT_KEY
+    FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS checkpoint
+        WHERE checkpoint.DATASET_NAME = 'REDEMPTION'
+          AND checkpoint.SOURCE_FILENAME = parsed.SOURCE_FILENAME
+          AND checkpoint.SOURCE_FILE_CONTENT_KEY = parsed.SOURCE_FILE_CONTENT_KEY
+          AND checkpoint.STAGE_NAME = 'REDEMPTION_PROCESSING'
+          AND checkpoint.STATUS = 'SUCCEEDED'
+    );
+
+    SELECT COUNT(*) INTO :v_file_count
+      FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'REDEMPTION' AS DATASET_NAME, SOURCE_FILENAME,
+               SOURCE_FILE_CONTENT_KEY,
+               'REDEMPTION_PROCESSING' AS STAGE_NAME
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        RUN_ID = :v_run_id, STATUS = 'STARTED', ROWS_PROCESSED = 0,
+        STARTED_AT = CURRENT_TIMESTAMP(), ENDED_AT = NULL, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        DATASET_NAME, SOURCE_FILENAME, SOURCE_FILE_CONTENT_KEY, STAGE_NAME,
+        RUN_ID, STATUS, ROWS_PROCESSED, STARTED_AT
+    )
+    VALUES
+    (
+        source.DATASET_NAME, source.SOURCE_FILENAME,
+        source.SOURCE_FILE_CONTENT_KEY, source.STAGE_NAME,
+        :v_run_id, 'STARTED', 0, CURRENT_TIMESTAMP()
+    );
 
     -- Enforce referential integrity again against the committed current member
     -- table so no transaction can be filtered out without a quarantine reason.
@@ -1173,6 +1654,14 @@ BEGIN
             redemption.SOURCE_FILE_CONTENT_KEY
         FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS redemption
         WHERE redemption.MEMBER_ID IS NOT NULL
+          AND EXISTS
+          (
+              SELECT 1
+              FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES AS pending
+              WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+                AND pending.SOURCE_FILE_CONTENT_KEY =
+                    redemption.SOURCE_FILE_CONTENT_KEY
+          )
           AND NOT EXISTS
           (
               SELECT 1
@@ -1230,6 +1719,14 @@ BEGIN
          AND result.RUN_ID = :v_run_id
          AND result.DATASET_NAME = 'REDEMPTION'
          AND result.STATUS = 'FAILED'
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES AS pending
+            WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+              AND pending.SOURCE_FILE_CONTENT_KEY =
+                  redemption.SOURCE_FILE_CONTENT_KEY
+        )
         GROUP BY redemption.RECORD_KEY, redemption.SOURCE_FILENAME,
                  redemption.SOURCE_ROW_NUMBER, redemption.SOURCE_FILE_CONTENT_KEY,
                  redemption.ORIGINAL_PAYLOAD, redemption.TRANSACTION_INDEX
@@ -1287,6 +1784,14 @@ BEGIN
     FROM SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS redemption
     WHERE redemption.REDEMPTION_ID IS NOT NULL
       AND redemption.MEMBER_ID IS NOT NULL
+      AND EXISTS
+      (
+          SELECT 1
+          FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES AS pending
+          WHERE pending.SOURCE_FILENAME = redemption.SOURCE_FILENAME
+            AND pending.SOURCE_FILE_CONTENT_KEY =
+                redemption.SOURCE_FILE_CONTENT_KEY
+      )
       AND EXISTS
       (
           SELECT 1
@@ -1361,14 +1866,44 @@ BEGIN
         :v_run_id, :v_processed_at
     );
 
+    MERGE INTO SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS AS target
+    USING
+    (
+        SELECT 'REDEMPTION' AS DATASET_NAME, pending.SOURCE_FILENAME,
+               pending.SOURCE_FILE_CONTENT_KEY,
+               'REDEMPTION_PROCESSING' AS STAGE_NAME,
+               COUNT(parsed.RECORD_KEY) AS ROWS_PROCESSED
+        FROM SKYPOINTS_DB.STAGING.PENDING_REDEMPTION_PROCESSING_FILES AS pending
+        LEFT JOIN SKYPOINTS_DB.STAGING.REDEMPTION_PARSED AS parsed
+          ON parsed.SOURCE_FILENAME = pending.SOURCE_FILENAME
+         AND parsed.SOURCE_FILE_CONTENT_KEY = pending.SOURCE_FILE_CONTENT_KEY
+        GROUP BY pending.SOURCE_FILENAME, pending.SOURCE_FILE_CONTENT_KEY
+    ) AS source
+       ON target.DATASET_NAME = source.DATASET_NAME
+      AND target.SOURCE_FILENAME = source.SOURCE_FILENAME
+      AND target.SOURCE_FILE_CONTENT_KEY = source.SOURCE_FILE_CONTENT_KEY
+      AND target.STAGE_NAME = source.STAGE_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STATUS = 'SUCCEEDED', ROWS_PROCESSED = source.ROWS_PROCESSED,
+        ENDED_AT = CURRENT_TIMESTAMP(), ERROR_DETAILS = NULL;
+
     UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
        SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'SUCCEEDED',
            ROWS_PROCESSED = :v_rows_processed
      WHERE RUN_ID = :v_run_id AND TASK_NAME = 'TASK_REDEMPTION_PROCESSING';
 
-    RETURN OBJECT_CONSTRUCT('run_id', v_run_id, 'redemptions_processed', v_rows_processed);
+    RETURN OBJECT_CONSTRUCT(
+        'run_id', v_run_id,
+        'redemptions_processed', v_rows_processed,
+        'files_processed', v_file_count
+    );
 EXCEPTION
     WHEN OTHER THEN
+        UPDATE SKYPOINTS_DB.AUDIT.ETL_FILE_STAGE_STATUS
+           SET STATUS = 'FAILED', ENDED_AT = CURRENT_TIMESTAMP(),
+               ERROR_DETAILS = :SQLERRM
+         WHERE RUN_ID = :v_run_id AND STAGE_NAME = 'REDEMPTION_PROCESSING'
+           AND STATUS = 'STARTED';
         UPDATE SKYPOINTS_DB.AUDIT.PHASE45_AUDIT
            SET ENDED_AT = CURRENT_TIMESTAMP(), STATUS = 'FAILED',
                ERROR_DETAILS = :SQLERRM

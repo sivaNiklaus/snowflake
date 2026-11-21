@@ -14,6 +14,9 @@ RECONCILIATION = (
 EXECUTION = (
     ROOT / "sql" / "orchestration" / "execute_country_routing.sql"
 ).read_text(encoding="utf-8")
+PIPELINE_DEPLOYMENT = (
+    ROOT / "sql" / "orchestration" / "deploy_unified_pipeline.sql"
+).read_text(encoding="utf-8")
 MONITORING = (
     ROOT / "sql" / "orchestration" / "monitor_country_routing.sql"
 ).read_text(encoding="utf-8")
@@ -198,13 +201,17 @@ def test_reconciliation_task_is_downstream_suspended_and_manually_executed() -> 
     assert "CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING()" in task
     assert "SCHEDULE =" not in RECONCILIATION.upper()
     assert "TASK_COUNTRY_RECONCILIATION SUSPEND" in RECONCILIATION
-    assert EXECUTION.index("TASK_COUNTRY_RECONCILIATION RESUME") < EXECUTION.index(
+    assert PIPELINE_DEPLOYMENT.index(
+        "TASK_COUNTRY_RECONCILIATION RESUME"
+    ) < PIPELINE_DEPLOYMENT.index(
         "TASK_COUNTRY_ROUTING RESUME"
     )
-    assert EXECUTION.index("TASK_COUNTRY_RECONCILIATION SUSPEND") < EXECUTION.index(
+    assert PIPELINE_DEPLOYMENT.index(
+        "TASK_COUNTRY_RECONCILIATION SUSPEND"
+    ) < PIPELINE_DEPLOYMENT.index(
         "TASK_COUNTRY_ROUTING SUSPEND"
     )
-    assert "EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT" in EXECUTION
+    assert "CALL SKYPOINTS_DB.AUDIT.SP_RUN_COMPLETE_PIPELINE()" in EXECUTION
 
 
 def test_monitoring_and_documentation_cover_phase6b_and_phase6c() -> None:

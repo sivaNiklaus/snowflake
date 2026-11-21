@@ -238,10 +238,10 @@ permissions/task ownership, graph behavior, task history/retry semantics,
 MERGE execution, and production source value domains. The project does not
 deploy or execute these scripts against a live Snowflake account. Status
 values (`COMPLETED`/`PENDING`) and active flags (`A`/`I`) are based on the
-supplied sample and should be confirmed with source owners. Incremental
-processing, document-level handling for missing/non-array redemption arrays,
-curated analytics products beyond Phase 6A, and Phase 7 scheduling remain out
-of scope.
+supplied sample and should be confirmed with source owners. Document-level
+handling for missing/non-array redemption arrays and curated analytics
+products remain out of scope. Phase 7 adds file-stage incremental processing
+and controlled manual orchestration; scheduled execution remains out of scope.
 
 ## Phase 6A-6C: country routing, movement, and reconciliation
 
@@ -309,10 +309,11 @@ suspended on deployment, and have no schedule. Manually execute the full graph:
 snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
 ```
 
-The script resumes descendants in reverse dependency order, invokes the
-existing suspended member-ingestion root with `AWAIT`, and suspends the
-descendants after success. If a failure prevents cleanup, suspend descendants
-manually after reviewing task history.
+After deploying Phase 7, this compatibility execution script calls the
+unified run procedure. It uses the managed run guard and cleans up task
+suspension after success or failure. For initial Phase 3-6C manual runs before
+Phase 7 deployment, use the older Phase-specific execution scripts only with
+the understanding that their cleanup behavior is less comprehensive.
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/orchestration/monitor_country_routing.sql
@@ -338,6 +339,77 @@ reconciliation results. Reconciliation reports but does not repair
 discrepancies. Concurrent independent graph runs are not a supported operating
 mode. Existing country tables with manually changed schemas are not altered
 automatically.
+
+## Phase 7B-7D: unified execution, recovery, and monitoring
+
+Deploy in dependency order after Phase 2 infrastructure is available:
+
+1. `sql/orchestration/deploy_ingestion_task_graph.sql`
+2. `sql/processing/deploy_ingestion_dq_and_business_transformation.sql`
+3. `sql/processing/deploy_country_routing.sql`
+4. `sql/processing/deploy_country_movement_reconciliation.sql`
+5. `sql/orchestration/deploy_unified_pipeline.sql`
+
+Use the same task-owning role for the graph and unified procedures. Deployment
+does not execute tasks; the root and all descendants are left suspended, with
+no schedule. Run the entire Phase 3-6C graph only through the controlled
+entry-point script:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_unified_pipeline.sql
+```
+
+`AUDIT.SP_RUN_COMPLETE_PIPELINE()` acquires a singleton run guard, resumes
+descendants in reverse dependency order, manually triggers the member-ingestion
+root and waits for graph completion, captures the Snowflake graph run ID and
+task outcomes in `AUDIT.PIPELINE_RUN_AUDIT`, and suspends the root and
+descendants after both success and failure. It reports blocked overlapping
+managed runs and re-raises a failed graph after cleanup. Direct concurrent
+execution outside this entry point is not supported.
+
+The Phase 4-5 procedures incrementally select files with no successful
+checkpoint for the current stage. `AUDIT.ETL_FILE_STAGE_STATUS` identifies a
+file by dataset, source filename, content key, and stage, and retains the most
+recent status and run ID. `STARTED` and `FAILED` stages are eligible for
+reprocessing. Parse/DQ and business writes are merge-based; member current and
+history updates are transactional, and redemption facts are idempotent. The
+country routing task still synchronizes the current member set on each graph
+run. Raw `COPY INTO` uses Snowflake load metadata without `FORCE`; standard
+load-history retention is finite (commonly 64 days), and is not a permanent
+source-file ledger.
+
+For recovery, inspect `monitor_unified_pipeline.sql` and Snowflake task history,
+fix the source or operational failure, then run the same entry point again.
+Successful file/stage checkpoints are skipped, while incomplete stages are
+retried; idempotent merges handle a prior commit whose checkpoint update did
+not complete. Do not remove raw data or audit history to force a retry. If
+client/session loss leaves `PIPELINE_RUN_CONTROL.STATUS = 'RUNNING'`, verify
+that task history shows no active graph and suspend the descendants before an
+operator clears the stale lock.
+
+Run consolidated operational monitoring with:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
+```
+
+The queries report recent graph and task outcomes/durations, run comparisons,
+ingested source files and row counts, stage-level progress and failures, DQ
+valid/invalid/duplicate counts, quarantine totals, live core-table totals,
+country routing/movement counts, reconciliation status, and task/procedure
+errors. `SKYPOINTS_DB.AUDIT.PIPELINE_RUN_AUDIT`,
+`PIPELINE_RUN_CONTROL`, and `ETL_FILE_STAGE_STATUS` are the principal Phase 7
+audit objects; country and Phase 4-5 details remain in their existing audit
+tables.
+
+Task graphs do not provide a single transaction across stages. Each procedure
+commits independently; the member current/history mutation is transactional,
+but a later failure does not roll back prior tasks. Checkpoints and idempotent
+merges enable safe reruns but do not guarantee exactly-once behavior across S3,
+Snowflake COPY metadata, task history, and all audit writes. Snowflake runtime
+verification is still required for procedure/task compilation, privileges,
+graph waiting and history semantics, and lock behavior. Local static tests do
+not deploy or execute SQL.
 
 ## Phase 2 infrastructure reference (already provisioned)
 

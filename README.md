@@ -227,10 +227,11 @@ snow sql --connection <connection_name> --filename sql/orchestration/execute_cou
 ```
 
 The script resumes descendants in reverse dependency order, executes the
-existing suspended root with `AWAIT`, and suspends descendants again after
-success.
-After a failure, inspect task/audit history and suspend descendants manually
-if execution did not reach cleanup. Monitoring queries are in
+controlled graph runner, and attempts cleanup after both success and failure.
+Deploy Phase 7 before using this compatibility entry point. For complete run
+history and task-level metrics, use
+[`sql/orchestration/monitor_unified_pipeline.sql`](sql/orchestration/monitor_unified_pipeline.sql).
+Phase 6-specific monitoring queries remain in
 [`sql/orchestration/monitor_country_routing.sql`](sql/orchestration/monitor_country_routing.sql).
 They report task history, config and table row-count metadata, routing and
 movement audit, reconciliation results, and quarantine reasons. To run
@@ -244,6 +245,69 @@ Reconciliation reports discrepancies without repairing them. Concurrent
 independent manual graph runs are not a supported operating mode. An existing
 country table with a manually altered schema is reported by reconciliation
 and routing SQL failures remain visible.
+
+## Phase 7B-7D: unified execution, recovery, and monitoring
+
+Phase 7 adds a single controlled entry point for the existing Phase 3-6C task
+graph. Deploy the scripts in this order, using the same task-owning role:
+
+1. `sql/orchestration/deploy_ingestion_task_graph.sql`
+2. `sql/processing/deploy_ingestion_dq_and_business_transformation.sql`
+3. `sql/processing/deploy_country_routing.sql`
+4. `sql/processing/deploy_country_movement_reconciliation.sql`
+5. `sql/orchestration/deploy_unified_pipeline.sql`
+
+Deployment leaves the root and descendants suspended and defines no schedule.
+To run the complete pipeline, call the controlled entry point:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_unified_pipeline.sql
+```
+
+`AUDIT.SP_RUN_COMPLETE_PIPELINE()` guards against overlapping managed runs,
+resumes descendants in reverse dependency order, manually triggers and waits
+for the root graph, records its graph run ID and outcome in
+`AUDIT.PIPELINE_RUN_AUDIT`, then suspends all tasks after success or failure.
+Task-level execution states and errors remain available through Snowflake task
+history. The runner re-raises a failed graph after attempting cleanup, so the
+original failure is not reported as success.
+
+Phase 4-5 downstream processing is incremental by source file and stage.
+`AUDIT.ETL_FILE_STAGE_STATUS` keys checkpoints by dataset, source filename,
+content key, and stage. Only a `SUCCEEDED` checkpoint is excluded from work;
+`STARTED` or `FAILED` files are eligible on the next full-graph run. Parse and
+DQ use idempotent merges, member current/history changes use a transaction and
+idempotent SCD2 logic, and redemption facts use an idempotent merge. Country
+routing continues to reconcile the current member set, including stale-output
+removal. Raw ingestion still uses Snowflake `COPY INTO` load history and does
+not force reloads; load-history retention is finite (commonly 64 days), so
+long-term deduplication/backfill policy must be managed with the Snowflake
+account's COPY history and source object retention.
+
+For recovery, inspect task history and the unified monitor, correct the source
+or permission issue, then run `execute_unified_pipeline.sql` again. Failed or
+interrupted downstream stages remain eligible; completed stages are skipped.
+Do not delete raw or audit records to force a retry. If a client is cancelled
+and `PIPELINE_RUN_CONTROL` remains `RUNNING`, first verify that no graph is
+active in task history and suspend descendants; only then may an operator
+clear the stale control row and record the manual intervention.
+
+The consolidated monitor includes pipeline/task history, ingestion files and
+rows, stage checkpoints, DQ and quarantine counts, current core totals, country
+movement counts, reconciliation results, and failed-task details:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
+```
+
+These are not distributed transactions: each task and procedure commits its
+own work. The member current/history mutation is transactional, but the graph
+as a whole is not rolled back when a later task fails. Checkpoints and
+idempotent merges make reruns safe; they do not provide exactly-once semantics
+across S3, Snowflake task history, and every audit write. A connection loss
+could leave the run-control row stale and requires the guarded manual recovery
+above. No Snowflake deployment or runtime execution is performed by the local
+static tests.
 
 ## Technology stack
 
@@ -451,15 +515,17 @@ execution is performed by the local static tests.
    validation, quarantine, member current/history, and redemption facts.
 6A. **Metadata-driven country routing (current):** approved-country member
    outputs; curated analytics products remain future work.
-7. **Scale and operations:** scheduling, workload tuning, backfills, and
-   operational automation; out of scope for the current phase.
+7. **Operations and reliability:** Phase 7B-7D adds controlled manual
+   orchestration, incremental stage checkpoints, safe reruns, and unified
+   monitoring. Scheduling, workload tuning, and external retry/alert services
+   remain out of scope.
 
 ## Validation commands
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m pytest
-snow sql --connection <connection_name> --filename sql/orchestration/monitor_ingestion_task_graph.sql
+python -m pytest -q
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql
 ```
 
 Python tests validate static SQL shape and fixtures. The Snowflake scripts
@@ -490,9 +556,9 @@ run against an account by the test suite.
   their source strings and are quarantined by DQ.
 - Accepted status and active-indicator values are based on the supplied
   sample and must be confirmed against a complete partner contract.
-- Parsing and business processing scan accumulated parsed history on each
-  manual run; a separately designed incremental strategy may be needed at
-  larger scale.
+- Parsing, DQ, and business processing use per-file stage checkpoints; the
+  checkpoints do not replace backup, retention, or account-level COPY history
+  management.
 - Empty redemption arrays intentionally produce no transaction rows. A
   document with a missing/non-array `redemptions` property is not expanded
   into a transaction and is not currently quarantined at document level.

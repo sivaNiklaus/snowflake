@@ -186,16 +186,8 @@ def test_country_routing_task_follows_phase45_and_remains_manual() -> None:
     assert "CALL SKYPOINTS_DB.CORE.SP_ROUTE_MEMBERS_BY_COUNTRY()" in task
     assert "SCHEDULE =" not in ROUTING_DEPLOYMENT.upper()
     assert "TASK_COUNTRY_ROUTING SUSPEND" in ROUTING_DEPLOYMENT
-    assert ROUTING_EXECUTION.index("TASK_COUNTRY_ROUTING RESUME") < ROUTING_EXECUTION.index(
-        "TASK_REDEMPTION_PROCESSING RESUME"
-    )
-    assert ROUTING_EXECUTION.index("TASK_REDEMPTION_INGESTION RESUME") < ROUTING_EXECUTION.index(
-        "EXECUTE TASK"
-    )
-    assert "EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT" in ROUTING_EXECUTION
-    assert ROUTING_EXECUTION.index("TASK_COUNTRY_ROUTING SUSPEND") > ROUTING_EXECUTION.index(
-        "EXECUTE TASK"
-    )
+    assert "CALL SKYPOINTS_DB.AUDIT.SP_RUN_COMPLETE_PIPELINE()" in ROUTING_EXECUTION
+    assert "ALTER TASK" not in ROUTING_EXECUTION.upper()
 
 
 def test_monitoring_includes_counts_quarantine_audit_and_reconciliation() -> None:

@@ -29,22 +29,26 @@ BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
 
-    INSERT INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
+    MERGE INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT AS target
+    USING
     (
-        RUN_ID,
-        TASK_NAME,
-        STARTED_AT,
-        STATUS,
-        ROWS_LOADED,
-        SOURCE_FILES
+        SELECT :v_run_id AS RUN_ID, 'TASK_MEMBER_INGESTION' AS TASK_NAME
+    ) AS source
+       ON target.RUN_ID = source.RUN_ID
+      AND target.TASK_NAME = source.TASK_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STARTED_AT = :v_started_at, ENDED_AT = NULL, STATUS = 'RUNNING',
+        ROWS_LOADED = 0, MEMBER_ROW_COUNT = NULL, REDEMPTION_ROW_COUNT = NULL,
+        SOURCE_FILES = :v_source_files, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_LOADED, SOURCE_FILES
     )
-    SELECT
-        :v_run_id,
-        'TASK_MEMBER_INGESTION',
-        :v_started_at,
-        'RUNNING',
-        0,
-        :v_source_files;
+    VALUES
+    (
+        source.RUN_ID, source.TASK_NAME, :v_started_at, 'RUNNING',
+        0, :v_source_files
+    );
 
     COPY INTO SKYPOINTS_DB.RAW.MEMBER_PROFILE_RAW
     (
@@ -127,22 +131,26 @@ BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
 
-    INSERT INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
+    MERGE INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT AS target
+    USING
     (
-        RUN_ID,
-        TASK_NAME,
-        STARTED_AT,
-        STATUS,
-        ROWS_LOADED,
-        SOURCE_FILES
+        SELECT :v_run_id AS RUN_ID, 'TASK_REDEMPTION_INGESTION' AS TASK_NAME
+    ) AS source
+       ON target.RUN_ID = source.RUN_ID
+      AND target.TASK_NAME = source.TASK_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STARTED_AT = :v_started_at, ENDED_AT = NULL, STATUS = 'RUNNING',
+        ROWS_LOADED = 0, MEMBER_ROW_COUNT = NULL, REDEMPTION_ROW_COUNT = NULL,
+        SOURCE_FILES = :v_source_files, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+    (
+        RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_LOADED, SOURCE_FILES
     )
-    SELECT
-        :v_run_id,
-        'TASK_REDEMPTION_INGESTION',
-        :v_started_at,
-        'RUNNING',
-        0,
-        :v_source_files;
+    VALUES
+    (
+        source.RUN_ID, source.TASK_NAME, :v_started_at, 'RUNNING',
+        0, :v_source_files
+    );
 
     COPY INTO SKYPOINTS_DB.RAW.REDEMPTION_RAW
     (
@@ -231,20 +239,21 @@ BEGIN
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID')
       INTO :v_run_id;
 
-    INSERT INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT
+    MERGE INTO SKYPOINTS_DB.AUDIT.INGESTION_AUDIT AS target
+    USING
     (
-        RUN_ID,
-        TASK_NAME,
-        STARTED_AT,
-        STATUS,
-        ROWS_LOADED
-    )
-    SELECT
-        :v_run_id,
-        'TASK_INGESTION_VALIDATION',
-        :v_started_at,
-        'RUNNING',
-        0;
+        SELECT :v_run_id AS RUN_ID, 'TASK_INGESTION_VALIDATION' AS TASK_NAME
+    ) AS source
+       ON target.RUN_ID = source.RUN_ID
+      AND target.TASK_NAME = source.TASK_NAME
+    WHEN MATCHED THEN UPDATE SET
+        STARTED_AT = :v_started_at, ENDED_AT = NULL, STATUS = 'RUNNING',
+        ROWS_LOADED = 0, MEMBER_ROW_COUNT = NULL, REDEMPTION_ROW_COUNT = NULL,
+        SOURCE_FILES = NULL, ERROR_DETAILS = NULL
+    WHEN NOT MATCHED THEN INSERT
+        (RUN_ID, TASK_NAME, STARTED_AT, STATUS, ROWS_LOADED)
+    VALUES
+        (source.RUN_ID, source.TASK_NAME, :v_started_at, 'RUNNING', 0);
 
     SELECT
         COUNT(*),
