@@ -62,10 +62,9 @@ using this single trigger:
 EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT;
 ```
 
-The root has no schedule and runs only when manually triggered. Do not configure
-a daily schedule until a manual run and its validation have succeeded. Before
-running, ensure the existing auto-ingest pipes are not concurrently consuming
-the same S3 prefixes.
+The root has no schedule and runs only when manually triggered. Scheduling is
+out of scope. Before running, ensure the existing auto-ingest pipes are not
+concurrently consuming the same S3 prefixes.
 
 ### Audit, monitoring, and recovery
 
@@ -133,6 +132,115 @@ Task dependencies, suspended-child execution behavior, `EXECUTE TASK ... AWAIT`,
 [SYSTEM$TASK_RUNTIME_INFO](https://docs.snowflake.com/en/sql-reference/functions/system_task_runtime_info),
 and [TASK_HISTORY](https://docs.snowflake.com/en/sql-reference/functions/task_history)
 documentation.
+
+## Combined Phase 4-5: metadata-driven DQ and business processing
+
+Phase 4-5 adds processing downstream from the existing Phase 3 validation
+task. It does not alter raw table definitions, stages, formats, S3 integration,
+or ingestion procedures. Run the existing Phase 3 deployment first, then
+deploy the new DDL, procedures, and child tasks:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/processing/deploy_ingestion_dq_and_business_transformation.sql
+```
+
+Use the same deployment role that owns the Phase 3 task graph. It needs create
+and operate privileges for procedures/tables/tasks in the existing schemas,
+warehouse usage, and the required task execution privileges. The script uses
+idempotent table DDL, upserts the known DQ rules, replaces only its processing
+procedures/tasks. New tasks are suspended by default; deployment also suspends
+the existing Phase 3 descendants, leaving the full chain dormant and
+unscheduled. The Phase 3 root remains suspended.
+
+```text
+TASK_MEMBER_INGESTION
+ -> TASK_REDEMPTION_INGESTION
+ -> TASK_INGESTION_VALIDATION
+ -> TASK_PARSE_AND_NORMALIZE
+ -> TASK_DQ_VALIDATION
+ -> TASK_MEMBER_PROCESSING
+ -> TASK_REDEMPTION_PROCESSING
+```
+
+All tasks use `SKYPOINTS_ETL_WH` and the same owning role. Execute the full
+graph only after both deployment scripts have succeeded:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_ingestion_dq_and_business_transformation.sql
+```
+
+The execution script resumes descendants in reverse dependency order, manually
+starts the original suspended root, waits for all descendants, and suspends
+them again after a successful run. Deployment is separate and does not execute
+the graph. If execution fails before the final suspend statements, suspend the
+descendants manually after reviewing task history.
+Monitor runs with:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_ingestion_dq_and_business_transformation.sql
+```
+
+The monitor script includes task history, per-procedure audit, per-dataset DQ
+totals, individual rule outcome counts, quarantine totals, and current-member
+referential-integrity checks.
+
+### DQ configuration and quarantine
+
+`AUDIT.DQ_RULE_MASTER` stores configuration only; `RULE_TYPE` is matched to
+reviewed fixed SQL predicates and no metadata text is executed as SQL. The
+deployment seeds the following enabled rules:
+
+| Dataset | Rules |
+| --- | --- |
+| Member | `MEMBER_ID_NOT_NULL`, `MEMBER_NAME_NOT_NULL`, `DOB_VALID`, `ENROLLMENT_DATE_VALID`, `COUNTRY_NOT_NULL`, `IS_ACTIVE_VALID`, `MEMBER_RECORD_TYPE_VALID` |
+| Redemption | `REDEMPTION_ID_NOT_NULL`, `MEMBER_ID_NOT_NULL`, `FEED_DATE_VALID`, `POINTS_NON_NEGATIVE`, `STATUS_VALID`, `MEMBER_EXISTS` |
+
+An enabled unsupported `RULE_TYPE` raises a technical failure. Rule-level
+results are written to `AUDIT.DQ_RULE_RESULT` (one outcome per record/rule),
+and `AUDIT.DQ_EXECUTION` captures run counts, duplicate observations, and
+technical status. Invalid records are merged once into
+`STAGING.DQ_QUARANTINE` by dataset and stable source record key. Each
+quarantine row includes all DQ failure reasons, source lineage, and the
+original member line or redemption payload. DQ failures do not fail the task;
+SQL/object errors are audited and re-raised.
+
+The member parser uses the source's leading empty field: record type is field
+2, ID remains `VARCHAR` in field 4, and the optional postcode is field 13.
+`H` rows stay in parsed staging for traceability but are excluded from DQ and
+business member output. Enrollment and last-flight dates use `YYYYMMDD`, and
+DOB uses `MMDDYYYY` as evidenced by the fixture. `TRY_TO_DATE` preserves
+invalid source text and yields NULL for DQ rather than a fallback date.
+Redemption arrays are flattened with `LATERAL FLATTEN`; empty arrays produce
+no transaction rows.
+
+Duplicate member IDs are not DQ failures. The latest valid arrival wins by
+`INGESTED_AT DESC, SOURCE_FILENAME DESC, SOURCE_ROW_NUMBER DESC`, then stable
+tie-breakers. `INGESTED_AT` is Snowflake ingestion time, not a
+source-provided update time. Duplicate counts are observable in
+`DQ_EXECUTION`. Member history uses SCD2 effective times and current-row flags;
+it closes a version only when a business attribute changes, including country,
+and does not create history versions for unchanged profiles. Age is derived at
+processing time; missing last-flight dates produce NULL `STALE_MEMBER`.
+Redemptions are deduplicated by ID, checked against the updated member current
+table, and merged idempotently; rejected/unmatched transactions retain their
+original JSON and lineage in quarantine. The final processing procedure
+rechecks membership and records any unmatched transaction as a DQ failure
+before filtering eligible transactions into the core fact.
+
+These are local static SQL-shape checks, not Snowflake integration tests:
+
+```powershell
+python -m pytest
+```
+
+Live verification remains necessary for Snowflake Scripting compilation,
+permissions/task ownership, graph behavior, task history/retry semantics,
+MERGE execution, and production source value domains. The project does not
+deploy or execute these scripts against a live Snowflake account. Status
+values (`COMPLETED`/`PENDING`) and active flags (`A`/`I`) are based on the
+supplied sample and should be confirmed with source owners. Incremental
+processing, document-level handling for missing/non-array redemption arrays,
+country-specific Phase 6 outputs, and Phase 7 scheduling remain out of scope.
 
 ## Phase 2 infrastructure reference (already provisioned)
 
