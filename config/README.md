@@ -13,8 +13,10 @@ same locations in `sql/00_setup/create_s3_storage_integration.sql`. Set the
 IAM role ARN only in the account-level SQL script. Do not put credentials in
 this repository.
 
-`dev.yml`, `staging.yml`, and `prod.yml` are documentation-oriented
-configuration templates. They are not consumed automatically by the SQL
-scripts, Snowflake CLI, or the test-only GitHub Actions workflow. Replace
-marked values for the target environment and keep secrets in the approved
-secret-management system; do not commit credentials or tokens.
+`manage.py` reads these YAML target settings. `dev.yml` contains the
+repository's verified DEV database, warehouse, S3 bucket/prefixes, and
+integration; configure `connection_name` to match a local Snowflake CLI
+profile. The staging and production files remain templates without matching
+manifest targets. These files are not consumed automatically by standalone
+SQL or the test-only GitHub Actions workflow. Keep credentials and tokens in
+the approved secret-management system; do not commit them.

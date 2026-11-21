@@ -27,6 +27,13 @@ EXPECTED_SQL_FILES = (
     "sql/04_unified_pipeline/deploy_unified_pipeline.sql",
     "sql/04_unified_pipeline/execute_unified_pipeline.sql",
     "sql/04_unified_pipeline/monitor_unified_pipeline.sql",
+    "sql/05_lifecycle/suspend_pipeline_tasks.sql",
+    "sql/05_lifecycle/destroy_phase7.sql",
+    "sql/05_lifecycle/destroy_phase6_reconciliation.sql",
+    "sql/05_lifecycle/destroy_phase6_routing.sql",
+    "sql/05_lifecycle/destroy_phase45.sql",
+    "sql/05_lifecycle/destroy_phase3.sql",
+    "sql/05_lifecycle/destroy_pipes.sql",
 )
 
 EXPECTED_DIRECTORIES = (
@@ -39,6 +46,7 @@ EXPECTED_DIRECTORIES = (
     "sql/03_processing/country_routing",
     "sql/03_processing/country_movement_reconciliation",
     "sql/04_unified_pipeline",
+    "sql/05_lifecycle",
     "sources/definitions",
     "tests/fixtures/members",
     "tests/fixtures/redemptions",
@@ -72,3 +80,9 @@ def test_phase7_unified_sql_files_are_in_the_documented_ordered_tree() -> None:
     assert (ROOT / "sql/04_unified_pipeline/deploy_unified_pipeline.sql").is_file()
     assert (ROOT / "sql/04_unified_pipeline/execute_unified_pipeline.sql").is_file()
     assert (ROOT / "sql/04_unified_pipeline/monitor_unified_pipeline.sql").is_file()
+
+
+def test_lifecycle_interface_and_resource_inventory_are_present() -> None:
+    assert (ROOT / "sql/05_lifecycle/suspend_pipeline_tasks.sql").is_file()
+    assert (ROOT / "manage.py").is_file()
+    assert (ROOT / "docs/resource-inventory.md").is_file()

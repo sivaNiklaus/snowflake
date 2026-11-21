@@ -1,19 +1,100 @@
 # SkyPoints ETL runbook
 
 This runbook covers initial setup, deployment, execution, monitoring, and
-recovery. It does not execute Snowflake SQL automatically. Use an authorized
+recovery; commands only execute when explicitly invoked. Use an authorized
 Snowflake CLI connection and follow the organization's change and secret
 management procedures.
+
+## Lifecycle commands
+
+The lifecycle interface shells out to Snowflake CLI; it does not use a
+Snowflake Python connector:
+
+```powershell
+python manage.py deploy --target dev
+python manage.py run --target dev
+python manage.py monitor --target dev
+python manage.py destroy --target dev
+```
+
+Set `snowflake.connection_name` in `config/dev.yml` to the name of a local
+Snowflake CLI connection. The checked-in DEV file intentionally leaves this
+machine-specific value unconfigured. `manage.py` validates that value, the
+DCM manifest target, the configured storage integration and S3 stage URLs
+before contacting Snowflake. Staging and production are unavailable until
+their manifest targets and configurations are real; the command surface does
+not imply those environments are deployable.
+
+Deploy performs a connection/role preflight against the configured DCM
+project owner, validates relevant `snow` and per-command `snow dcm --help`
+options, creates (or recognizes an existing) DCM project, plans and deploys
+DCM-managed definitions, then deploys in this order:
+
+1. Both standalone ingestion pipes.
+2. Phase 3 ingestion task graph.
+3. Phase 4-5 parsing, DQ, and business processing.
+4. Phase 6A country routing.
+5. Phase 6B-6C reconciliation.
+6. Phase 7 unified pipeline controls.
+7. Final task suspension from leaf to root.
+
+Deployment never calls the pipeline runner. Existing pipes are left unchanged
+when the CLI reports they already exist; the manager does not replace them or
+claim to validate their definition drift. All completed and skipped steps are
+reported, and a failure stops later steps. Because this is not one Snowflake
+transaction, a failed deployment may leave completed objects in place; fix
+the reported issue and rerun the idempotent steps.
+
+The standalone SQL deployment order is:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_member_profile_pipe.sql
+snow sql --connection <connection_name> --filename sql/01_ingestion/pipes/create_redemption_pipe.sql
+snow sql --connection <connection_name> --filename sql/02_orchestration_ingestion/deploy_ingestion_task_graph.sql
+snow sql --connection <connection_name> --filename sql/03_processing/dq_and_transformation/deploy_ingestion_dq_and_business_transformation.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_routing/deploy_country_routing.sql
+snow sql --connection <connection_name> --filename sql/03_processing/country_movement_reconciliation/deploy_country_movement_reconciliation.sql
+snow sql --connection <connection_name> --filename sql/04_unified_pipeline/deploy_unified_pipeline.sql
+snow sql --connection <connection_name> --filename sql/05_lifecycle/suspend_pipeline_tasks.sql
+```
+
+For DCM, the manager first validates the installed command help, then invokes
+the repository-documented `snow dcm create`, `snow dcm plan`, and
+`snow dcm deploy` commands for target `DEV` and the configured connection.
+The manager requires each subcommand's help to document `--from`, `--target`,
+and `--connection` before it supplies `--from .`, `--target DEV`, and
+`--connection <connection_name>`. If the installed CLI documents a different
+syntax, the manager stops instead of guessing flags.
+
+`run` invokes the Phase 7 unified execution script. `monitor` invokes its
+read-only monitoring script. For destroy, the selected target and exact
+resource groups are printed before confirmation. Type the target name (for
+DEV, `DEV`) or pass `--yes`. A future configured `prod` additionally requires
+both `--yes` and `--allow-prod-destroy`. DEV's explicit destroy policy permits
+removal of `SKYPOINTS_ETL_WH`.
+
+Destroy suspends all nine tasks leaf-to-root, then removes Phase 7, Phase 6B-6C,
+Phase 6A, Phase 4-5, Phase 3, and pipe objects in reverse deployment order.
+The Snowflake CLI's own DCM help is inspected before any deletion. If it does
+not document a target-scoped teardown command, destroy stops before removing
+standalone resources. When supported, that CLI teardown removes the DCM
+resources, including the project-owned warehouse. It never removes the
+database, parent `AUDIT` schema, storage integration, S3 data, AWS IAM
+resources, or bucket notifications. Destroy is irreversible for the listed
+audit and quarantine tables; it is not a data-backup mechanism.
+
+For exact ownership and the complete named resource list, see
+[`resource-inventory.md`](resource-inventory.md).
 
 ## Initial environment setup
 
 1. Install the Snowflake CLI version required by the root README and configure
    a named local connection. Credentials belong in the CLI profile or the
    organization's approved secret store, never in this repository.
-2. Review `config/dev.yml`, `config/staging.yml`, or `config/prod.yml`. These
-   files are documentation templates, not automatically consumed settings.
-   Configure each environment's database, warehouse, connection name, storage
-   integration, S3 bucket, and prefixes where marked.
+2. Review the target YAML files. `manage.py` consumes them; set the local
+   Snowflake CLI connection name in `config/dev.yml`. The S3 bucket, prefixes,
+   database, warehouse, and integration are matched against checked-in
+   definitions. Staging/prod placeholders are not deployable.
 3. Configure the S3 bucket and prefixes consistently in
    `sources/definitions/02_raw_ingestion.sql` and
    `sql/00_setup/create_s3_storage_integration.sql`. Configure the IAM role
@@ -55,9 +136,13 @@ Complete prerequisite setup before deploying task orchestration:
 7. Deploy unified Phase 7 orchestration last with
    `sql/04_unified_pipeline/deploy_unified_pipeline.sql`.
 
-Deployment scripts are rerunnable where implemented, but inspect each script
-and the Snowflake change plan before redeployment. Do not infer rollback from
-DDL deployment or task execution; Snowflake does not provide a transaction
+`python manage.py deploy --target dev` runs this DCM and standalone SQL
+sequence, including the final leaf-to-root task suspension. Do not separately
+execute the per-phase deployment scripts as part of the same lifecycle run.
+
+Standalone deployment scripts are rerunnable where implemented, but inspect
+the DCM change plan before deployment. Do not infer rollback from DDL
+deployment or task execution; Snowflake does not provide a transaction
 spanning this pipeline.
 
 ## Execute the unified pipeline

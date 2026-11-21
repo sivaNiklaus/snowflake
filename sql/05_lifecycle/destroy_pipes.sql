@@ -1,0 +1,3 @@
+-- Pipes only; their external S3 bucket notifications are not modified.
+DROP PIPE IF EXISTS SKYPOINTS_DB.RAW.REDEMPTION_PIPE;
+DROP PIPE IF EXISTS SKYPOINTS_DB.RAW.MEMBER_PROFILE_PIPE;

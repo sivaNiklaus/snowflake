@@ -11,6 +11,7 @@
 | `03_processing/country_routing/` | Phase 6 country-routing deployment, execution, and monitoring. |
 | `03_processing/country_movement_reconciliation/` | Phase 6 country-movement reconciliation deployment. |
 | `04_unified_pipeline/` | Phase 7 unified Phase 3-6C orchestration deployment, execution, and monitoring. |
+| `05_lifecycle/` | Leaf-to-root task suspension and reverse-order standalone resource teardown scripts, called by `manage.py`. |
 
 Scripts prefixed `deploy_` install or update Snowflake objects; `execute_`
 scripts trigger work; `monitor_` scripts are read-only operational queries.

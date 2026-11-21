@@ -35,6 +35,53 @@ unchanged. The member raw table stores each complete source line in
 and allowlisted DQ rules, retains all failures in quarantine, and processes
 valid data into core tables.
 
+## Lifecycle commands
+
+`manage.py` is the project entry point for deployment and operations:
+
+```powershell
+python manage.py deploy --target dev
+python manage.py run --target dev
+python manage.py monitor --target dev
+python manage.py destroy --target dev
+```
+
+Configure `snowflake.connection_name` in `config/dev.yml` to match a local
+Snowflake CLI connection before running these commands. DEV's database,
+warehouse, bucket, prefixes, and integration are populated from the verified
+repository definitions. Provision the account-level storage integration once
+with the configured IAM role before deploying; the manager validates it but
+does not create or delete it. The manager validates the connection role against
+the DCM target owner before deploy/destroy, checks the installed Snowflake CLI
+help for the commands and options it will use, then invokes `snow` through
+subprocesses. It does not use a Python Snowflake connector.
+
+Deploy runs `snow dcm create`, `plan`, and (when the plan has changes) `deploy`,
+then creates the pipes and deploys Phases 3, 4-5, 6A, 6B-6C, and 7 in
+dependency order. It does not run the pipeline and explicitly leaves all nine
+tasks suspended. On failure it stops and lists completed steps; rerun after
+resolving the reported issue. The standalone scripts are rerunnable except
+existing pipes are kept rather than replaced when already present.
+
+`run` invokes the unified Phase 3-6C execution script; `monitor` invokes its
+read-only monitoring script. For `destroy`, type `DEV` at the prompt or use `--yes`. If the installed DCM
+CLI exposes a target-scoped teardown command, destroy suspends tasks leaf-to-root
+and removes standalone objects in reverse deployment order before invoking
+that DCM command. The DEV destroy policy permits deletion of the project-owned
+warehouse. It always protects the database, parent `AUDIT` schema, storage
+integration, S3 data, and AWS IAM resources. `prod`, if later configured,
+requires both `--yes` and `--allow-prod-destroy`.
+
+The current manifest defines only `DEV`. `staging` and `prod` are rejected
+until real manifest targets and complete configuration files exist. The
+manager probes the installed `snow dcm --help` for an explicitly documented
+teardown command before deleting anything. If that help does not expose a
+target-scoped DCM destroy/drop operation, destroy stops before removing
+standalone resources. The current development host had no Snowflake CLI
+installed, so actual DCM teardown support could not be confirmed here. See the
+[resource inventory](docs/resource-inventory.md) and
+[runbook](docs/runbook.md) for ownership, sequencing, and recovery details.
+
 ## Combined Phase 4-5 processing
 
 The ingestion, DQ, and business-transformation deployment in
@@ -321,7 +368,7 @@ static tests.
   The DCM manifest and definition layout follows the current format
   (`manifest_version: 2`); it was checked with Snowflake CLI 3.34.0.
 - **AWS S3** as the member and redemption source landing zone.
-- **Python** for future utilities and tests.
+- **Python** for lifecycle orchestration and static tests.
 - **GitHub** and **GitHub Actions** for source control and foundational CI.
 
 ## Repository structure
@@ -338,6 +385,7 @@ static tests.
 │   └── prod.yml
 ├── docs/
 │   ├── architecture.md
+│   ├── resource-inventory.md
 │   └── runbook.md
 ├── sql/
 │   ├── README.md
@@ -369,10 +417,18 @@ static tests.
 │   │   │   └── monitor_country_routing.sql
 │   │   └── country_movement_reconciliation/
 │   │       └── deploy_country_movement_reconciliation.sql
-│   └── 04_unified_pipeline/
-│       ├── deploy_unified_pipeline.sql
-│       ├── execute_unified_pipeline.sql
-│       └── monitor_unified_pipeline.sql
+│   ├── 04_unified_pipeline/
+│   │   ├── deploy_unified_pipeline.sql
+│   │   ├── execute_unified_pipeline.sql
+│   │   └── monitor_unified_pipeline.sql
+│   └── 05_lifecycle/
+│       ├── suspend_pipeline_tasks.sql
+│       ├── destroy_phase7.sql
+│       ├── destroy_phase6_reconciliation.sql
+│       ├── destroy_phase6_routing.sql
+│       ├── destroy_phase45.sql
+│       ├── destroy_phase3.sql
+│       └── destroy_pipes.sql
 ├── sources/
 │   └── definitions/
 │       ├── 01_foundation.sql
@@ -385,6 +441,7 @@ static tests.
 ├── .env.example
 ├── .gitignore
 ├── manifest.yml
+├── manage.py
 ├── README.md
 └── requirements.txt
 ```
@@ -396,9 +453,9 @@ and external stages. The existing `SKYPOINTS_DB` database and parent `AUDIT`
 schema are intentionally outside DCM management. Phase task/procedure
 deployment and standalone load/validation scripts are separate SQL under the
 numbered `sql/` folders; they do not recreate DCM-managed objects.
-The YAML files in `config/` document environment-specific settings to supply;
-they are templates and are not automatically loaded by Snowflake or the CI
-workflow. The existing GitHub Actions workflow is test-only.
+`manage.py` reads `config/` settings. They are not automatically loaded by
+Snowflake or the CI workflow. The staging and production files remain
+unconfigured templates; the existing GitHub Actions workflow is test-only.
 
 ## Local development setup
 
@@ -413,8 +470,9 @@ python -m pip install -r requirements.txt
 python -m pytest
 ```
 
-The only initial Python dependency is `pytest`, used by the CI workflow. Add
-runtime or transformation libraries only when a later phase needs them.
+`pytest` runs the static test suite, and `PyYAML` parses lifecycle target
+configuration. The CI workflow runs tests only; it does not deploy to
+Snowflake.
 
 ### Snowflake CLI
 

@@ -58,6 +58,11 @@ Phase 6 scripts remain available for phase-specific operation.
 
 ## Object ownership and operations
 
+- `manage.py` sequences DCM deployment with standalone SQL deployment, and
+  provides separate unified run, monitor, and guarded destroy commands.
+  Lifecycle ordering and destructive ownership boundaries are documented in
+  [`resource-inventory.md`](resource-inventory.md) and
+  [`runbook.md`](runbook.md).
 - DCM definitions under `sources/definitions/` manage the declared project
   infrastructure. The existing `SKYPOINTS_DB` database and parent `AUDIT`
   schema are outside DCM management.
