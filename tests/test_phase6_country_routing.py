@@ -211,4 +211,6 @@ def test_monitoring_includes_counts_quarantine_audit_and_reconciliation() -> Non
     assert "UNSUPPORTED_INACTIVE_OR_MISSING_MEMBERS_ROUTED" in ROUTING_MONITORING
     assert "AS member_route_counts" in ROUTING_MONITORING
     assert "AS duplicated_routes" in ROUTING_MONITORING
-    assert "WHERE member.MEMBER_ID IS NULL OR routed.COUNTRY_CODE" in ROUTING_MONITORING
+    assert "WHERE status.MEMBER_ID IS NULL" in ROUTING_MONITORING
+    assert "routed.COUNTRY_CODE '" in ROUTING_MONITORING
+    assert "'IS DISTINCT FROM status.COUNTRY_CODE)" in ROUTING_MONITORING

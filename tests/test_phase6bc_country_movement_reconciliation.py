@@ -217,3 +217,43 @@ def test_monitoring_and_documentation_cover_phase6b_and_phase6c() -> None:
     assert "SP_VALIDATE_COUNTRY_ROUTING" in README
     assert "Phase 6B" in SQL_README
     assert "Phase 6C" in SQL_README
+
+
+def test_generated_reconciliation_preserves_only_latest_quarantined_country() -> None:
+    generator = MONITORING.split(
+        "-- Generate an exact reconciliation query", 1
+    )[1]
+    assert "COUNTRY_MOVEMENT_AUDIT AS movement" in generator
+    assert "movement.ACTION = ''QUARANTINED''" in generator
+    assert "movement.STATUS = ''QUARANTINED''" in generator
+    assert "invalid.COUNTRY_CODE IS NOT DISTINCT FROM movement.DESTINATION_COUNTRY" in generator
+    assert "PARTITION BY movement.MEMBER_ID" in generator
+    assert "ORDER BY movement.UPDATED_AT DESC" in generator
+    assert "SPLIT_TO_TABLE(movement.PREVIOUS_COUNTRY" in generator
+    assert "preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE" in generator
+    assert "NOT status.HAS_VALID_DESTINATION AND NOT EXISTS" in generator
+
+
+def test_generated_reconciliation_checks_current_member_id_uniqueness() -> None:
+    generator = MONITORING.split(
+        "-- Generate an exact reconciliation query", 1
+    )[1]
+    assert "WHERE MEMBER_ID IS NULL) AS MEMBER_CURRENT_NULL_MEMBER_IDS" in generator
+    assert "GROUP BY MEMBER_ID HAVING COUNT(*) > 1" in generator
+    assert "AS MEMBER_CURRENT_DUPLICATE_MEMBER_IDS" in generator
+
+
+def test_generated_reconciliation_keeps_allowlist_and_is_read_only() -> None:
+    generator = MONITORING.split(
+        "-- Generate an exact reconciliation query", 1
+    )[1]
+    approved_values = generator.split("FROM VALUES", 1)[1].split(
+        "AS approved(COUNTRY_CODE)", 1
+    )[0]
+    assert re.findall(r"\('([A-Z]{3})'\)", approved_values) == APPROVED_COUNTRIES
+    assert not re.search(
+        r"\b(?:INSERT\s+INTO|UPDATE\s+SKYPOINTS_DB|DELETE\s+FROM|MERGE\s+INTO|CALL\s+SKYPOINTS_DB)\b",
+        generator,
+        re.IGNORECASE,
+    )
+    assert "AS UNAPPROVED_COUNTRY_TABLES" in generator

@@ -115,18 +115,17 @@ ORDER BY FAILURE_REASON;
 -- country tables. Copy and run the returned SQL text in the same account.
 WITH approved_tables AS
 (
-    SELECT config.COUNTRY_CODE, config.TARGET_TABLE
-    FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
+    SELECT approved.COUNTRY_CODE, 'MEMBER_' || approved.COUNTRY_CODE AS TARGET_TABLE
+    FROM VALUES
+        ('USA'), ('IND'), ('GBR'), ('CAN'), ('AUS'),
+        ('DEU'), ('FRA'), ('JPN'), ('SGP'), ('NZL'),
+        ('ZAF'), ('BRA'), ('MEX'), ('ARE'), ('SAU'),
+        ('KOR'), ('ITA'), ('ESP'), ('NLD'), ('CHE')
+        AS approved(COUNTRY_CODE)
     JOIN SKYPOINTS_DB.INFORMATION_SCHEMA.TABLES AS tables
       ON tables.TABLE_SCHEMA = 'CORE'
-     AND tables.TABLE_NAME = config.TARGET_TABLE
+     AND tables.TABLE_NAME = 'MEMBER_' || approved.COUNTRY_CODE
      AND tables.TABLE_TYPE = 'BASE TABLE'
-    WHERE config.COUNTRY_CODE IN
-    (
-        'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-        'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-    )
-      AND config.TARGET_TABLE = 'MEMBER_' || config.COUNTRY_CODE
 )
 SELECT
     'WITH routed AS ('
@@ -140,40 +139,75 @@ SELECT
         'SELECT NULL::VARCHAR(3) AS COUNTRY_CODE, '
         || 'NULL::VARCHAR AS MEMBER_ID WHERE FALSE'
     )
-    || '), valid_current AS ('
-    || 'SELECT member.MEMBER_ID, UPPER(TRIM(member.COUNTRY)) AS COUNTRY_CODE '
-    || 'FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
-    || 'JOIN SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config '
-    || 'ON config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY)) '
-    || 'AND config.IS_ACTIVE '
-    || 'WHERE config.COUNTRY_CODE IN '
+    || '), member_status AS ('
+    || 'SELECT member.MEMBER_ID, NULLIF(UPPER(TRIM(member.COUNTRY)), '''') AS COUNTRY_CODE, '
+    || 'EXISTS (SELECT 1 FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config '
+    || 'WHERE config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY)) AND config.IS_ACTIVE '
+    || 'AND config.COUNTRY_CODE IN '
     || '(''USA'',''IND'',''GBR'',''CAN'',''AUS'',''DEU'',''FRA'',''JPN'','
     || '''SGP'',''NZL'',''ZAF'',''BRA'',''MEX'',''ARE'',''SAU'',''KOR'','
-    || '''ITA'',''ESP'',''NLD'',''CHE'')'
+    || '''ITA'',''ESP'',''NLD'',''CHE'')) AS HAS_VALID_DESTINATION '
+    || 'FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member'
+    || '), invalid_destinations AS ('
+    || 'SELECT MEMBER_ID, COUNTRY_CODE FROM member_status WHERE NOT HAS_VALID_DESTINATION'
+    || '), latest_quarantined_movements AS ('
+    || 'SELECT movement.MEMBER_ID, movement.PREVIOUS_COUNTRY '
+    || 'FROM SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT AS movement '
+    || 'JOIN invalid_destinations AS invalid ON invalid.MEMBER_ID = movement.MEMBER_ID '
+    || 'AND invalid.COUNTRY_CODE IS NOT DISTINCT FROM movement.DESTINATION_COUNTRY '
+    || 'WHERE movement.ACTION = ''QUARANTINED'' AND movement.STATUS = ''QUARANTINED'' '
+    || 'QUALIFY ROW_NUMBER() OVER (PARTITION BY movement.MEMBER_ID '
+    || 'ORDER BY movement.UPDATED_AT DESC) = 1'
+    || '), preserved AS ('
+    || 'SELECT DISTINCT movement.MEMBER_ID, '
+    || 'UPPER(TRIM(previous_country.VALUE::VARCHAR)) AS PREVIOUS_COUNTRY '
+    || 'FROM latest_quarantined_movements AS movement, '
+    || 'LATERAL SPLIT_TO_TABLE(movement.PREVIOUS_COUNTRY, '','') AS previous_country '
+    || 'WHERE previous_country.VALUE IS NOT NULL'
     || ') SELECT '
     || '(SELECT COALESCE(COUNT_IF(route_count <> 1 OR matching_count <> 1), 0) '
-    || 'FROM (SELECT current_member.MEMBER_ID, COUNT(routed.MEMBER_ID) AS route_count, '
+    || 'FROM (SELECT current_member.MEMBER_ID, current_member.COUNTRY_CODE, '
+    || 'COUNT(routed.MEMBER_ID) AS route_count, '
     || 'COALESCE(COUNT_IF(routed.COUNTRY_CODE = current_member.COUNTRY_CODE), 0) AS matching_count '
-    || 'FROM valid_current AS current_member LEFT JOIN routed '
+    || 'FROM member_status AS current_member LEFT JOIN routed '
     || 'ON routed.MEMBER_ID = current_member.MEMBER_ID '
-    || 'GROUP BY current_member.MEMBER_ID) AS member_route_counts)) '
+    || 'WHERE current_member.HAS_VALID_DESTINATION '
+    || 'GROUP BY current_member.MEMBER_ID, current_member.COUNTRY_CODE) '
+    || 'AS member_route_counts) '
     || 'AS VALID_CURRENT_NOT_ROUTED_EXACTLY_ONCE, '
     || '(SELECT COUNT(*) FROM (SELECT MEMBER_ID FROM routed '
     || 'GROUP BY MEMBER_ID HAVING COUNT(*) > 1) AS duplicated_routes) '
     || 'AS MEMBER_IDS_DUPLICATED_ACROSS_COUNTRY_TABLES, '
     || '(SELECT COUNT(*) FROM routed '
-    || 'LEFT JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
-    || 'ON member.MEMBER_ID = routed.MEMBER_ID '
-    || 'WHERE member.MEMBER_ID IS NULL OR routed.COUNTRY_CODE '
-    || 'IS DISTINCT FROM UPPER(TRIM(member.COUNTRY))) '
+    || 'LEFT JOIN member_status AS status ON status.MEMBER_ID = routed.MEMBER_ID '
+    || 'WHERE status.MEMBER_ID IS NULL '
+    || 'OR (status.HAS_VALID_DESTINATION AND routed.COUNTRY_CODE '
+    || 'IS DISTINCT FROM status.COUNTRY_CODE) '
+    || 'OR (NOT status.HAS_VALID_DESTINATION AND NOT EXISTS '
+    || '(SELECT 1 FROM preserved WHERE preserved.MEMBER_ID = routed.MEMBER_ID '
+    || 'AND preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE))) '
     || 'AS MEMBERS_IN_WRONG_COUNTRY_TABLE, '
     || '(SELECT COUNT(*) FROM routed '
-    || 'JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
-    || 'ON member.MEMBER_ID = routed.MEMBER_ID '
-    || 'LEFT JOIN SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config '
-    || 'ON config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY)) '
-    || 'AND config.IS_ACTIVE '
-    || 'WHERE UPPER(TRIM(member.COUNTRY)) IS NULL OR config.COUNTRY_CODE IS NULL) '
-    || 'AS UNSUPPORTED_INACTIVE_OR_MISSING_MEMBERS_ROUTED;'
+    || 'JOIN member_status AS status ON status.MEMBER_ID = routed.MEMBER_ID '
+    || 'WHERE NOT status.HAS_VALID_DESTINATION AND NOT EXISTS '
+    || '(SELECT 1 FROM preserved WHERE preserved.MEMBER_ID = routed.MEMBER_ID '
+    || 'AND preserved.PREVIOUS_COUNTRY = routed.COUNTRY_CODE)) '
+    || 'AS UNSUPPORTED_INACTIVE_OR_MISSING_MEMBERS_ROUTED, '
+    || '(SELECT COUNT(*) FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT '
+    || 'WHERE MEMBER_ID IS NULL) AS MEMBER_CURRENT_NULL_MEMBER_IDS, '
+    || '(SELECT COUNT(*) FROM (SELECT MEMBER_ID '
+    || 'FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT WHERE MEMBER_ID IS NOT NULL '
+    || 'GROUP BY MEMBER_ID HAVING COUNT(*) > 1) AS duplicate_current_ids) '
+    || 'AS MEMBER_CURRENT_DUPLICATE_MEMBER_IDS, '
+    || '(SELECT COUNT(*) FROM SKYPOINTS_DB.INFORMATION_SCHEMA.TABLES '
+    || 'WHERE TABLE_SCHEMA = ''CORE'' AND TABLE_TYPE = ''BASE TABLE'' '
+    || 'AND STARTSWITH(TABLE_NAME, ''MEMBER_'') '
+    || 'AND TABLE_NAME NOT IN (''MEMBER_CURRENT'', ''MEMBER_HISTORY'', '
+    || '''MEMBER_USA'', ''MEMBER_IND'', ''MEMBER_GBR'', ''MEMBER_CAN'', '
+    || '''MEMBER_AUS'', ''MEMBER_DEU'', ''MEMBER_FRA'', ''MEMBER_JPN'', '
+    || '''MEMBER_SGP'', ''MEMBER_NZL'', ''MEMBER_ZAF'', ''MEMBER_BRA'', '
+    || '''MEMBER_MEX'', ''MEMBER_ARE'', ''MEMBER_SAU'', ''MEMBER_KOR'', '
+    || '''MEMBER_ITA'', ''MEMBER_ESP'', ''MEMBER_NLD'', ''MEMBER_CHE'')) '
+    || 'AS UNAPPROVED_COUNTRY_TABLES;'
     AS RECONCILIATION_SQL
 FROM approved_tables;
