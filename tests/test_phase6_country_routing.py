@@ -87,6 +87,14 @@ def test_country_tables_are_created_lazily_from_member_current_schema() -> None:
     )
 
 
+def test_routing_loop_results_have_explicit_member_country_fields() -> None:
+    assert ROUTING_DEPLOYMENT.count("config.COUNTRY_CODE AS COUNTRY_CODE") >= 2
+    assert ROUTING_DEPLOYMENT.count("config.TARGET_TABLE AS TARGET_TABLE") >= 2
+    assert "COUNTRY_CODE AS COUNTRY_CODE, TARGET_TABLE AS TARGET_TABLE" in ROUTING_DEPLOYMENT
+    assert "v_country_code := route_country.COUNTRY_CODE" in ROUTING_DEPLOYMENT
+    assert "v_country_code := configured_country.COUNTRY_CODE" in ROUTING_DEPLOYMENT
+
+
 def test_country_merge_columns_match_existing_member_current_definition() -> None:
     current_table = re.search(
         r"CREATE TABLE IF NOT EXISTS SKYPOINTS_DB\.CORE\.MEMBER_CURRENT\s*"

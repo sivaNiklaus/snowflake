@@ -284,7 +284,9 @@ BEGIN
     -- Create only tables for active, allowlisted countries with current members.
     FOR route_country IN
     (
-        SELECT config.COUNTRY_CODE, config.TARGET_TABLE
+        SELECT
+            config.COUNTRY_CODE AS COUNTRY_CODE,
+            config.TARGET_TABLE AS TARGET_TABLE
         FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
         JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
           ON decisions.NORMALIZED_COUNTRY = config.COUNTRY_CODE
@@ -312,7 +314,9 @@ BEGIN
 
     FOR route_country IN
     (
-        SELECT config.COUNTRY_CODE, config.TARGET_TABLE
+        SELECT
+            config.COUNTRY_CODE AS COUNTRY_CODE,
+            config.TARGET_TABLE AS TARGET_TABLE
         FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
         JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
           ON decisions.NORMALIZED_COUNTRY = config.COUNTRY_CODE
@@ -447,7 +451,7 @@ BEGIN
     -- Both operations share this transaction, so merge failures preserve old rows.
     FOR configured_country IN
     (
-        SELECT COUNTRY_CODE, TARGET_TABLE
+        SELECT COUNTRY_CODE AS COUNTRY_CODE, TARGET_TABLE AS TARGET_TABLE
         FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
         WHERE COUNTRY_CODE IN
         (
