@@ -4,7 +4,8 @@ SkyPoints ETL is a Snowflake-based data platform for loyalty-member profiles
 and partner-airline redemption transactions. It contains the Phase 1
 foundation, Phase 2 S3/Snowflake access infrastructure, Phase 3 raw ingestion,
 the combined **Phase 4-5: metadata-driven DQ and business processing** task
-graph, and **Phase 6A: metadata-driven country routing**.
+graph, and **Phase 6A-6C: country routing, movement synchronization, and
+reconciliation**.
 
 ## Business problem
 
@@ -139,7 +140,7 @@ for task history, procedure audits, DQ counts, rule outcomes, quarantine, and
 core referential-integrity queries. Monitoring and execution remain separate
 from deployment. Static tests do not deploy or execute SQL against Snowflake.
 
-## Phase 6A: metadata-driven country routing
+## Phase 6A-6C: country routing, movement, and reconciliation
 
 Phase 6A routes current `CORE.MEMBER_CURRENT` rows into lazily created
 `CORE.MEMBER_<COUNTRY_CODE>` outputs. The routing configuration and audit
@@ -151,6 +152,13 @@ Deploy Phase 6A after Phase 3 and Phase 4-5:
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
+```
+
+Then deploy the movement audit, reconciliation procedure/audit, and suspended
+reconciliation task:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/processing/deploy_country_movement_reconciliation.sql
 ```
 
 `AUDIT.COUNTRY_ROUTING_CONFIG` is seeded idempotently with exactly these
@@ -165,8 +173,9 @@ Redeployment inserts missing approved entries but does not update existing
 `TARGET_TABLE` or administrator-managed `IS_ACTIVE` values. Before routing,
 the procedure fails closed and records an audit error if it finds duplicate
 country codes, missing approved entries, unapproved countries, or target names
-that do not exactly match `MEMBER_<COUNTRY_CODE>`. Codes outside this allowlist
-are never routed, even if an extra configuration row is added manually.
+that do not exactly match `MEMBER_<COUNTRY_CODE>`, or null active flags. Codes
+outside this allowlist are never routed, even if an extra configuration row
+is added manually.
 Country tables are created only when an approved, active country has current
 members; each new table is created `LIKE CORE.MEMBER_CURRENT`. Routing uses
 the configured target only after configuration integrity checks, then uses
@@ -190,29 +199,51 @@ active, approved destination. Rows for members no longer present in
 `AUDIT.COUNTRY_ROUTING_AUDIT`, including inserted, updated, removed, routed,
 quarantined, and failed-run counts.
 
-The new task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
-`SKYPOINTS_ETL_WH`, is created suspended, and adds no schedule. Manually run
-the complete graph:
+**Phase 6B — country movement synchronization.** The existing routing task
+also synchronizes member country movements; it is not duplicated in a second
+movement task. Before synchronization it snapshots
+prior country-table membership. `AUDIT.COUNTRY_MOVEMENT_AUDIT` records each
+member's previous country, destination, action (`MOVED`, `INSERTED`,
+`SYNCHRONIZED`, or `QUARANTINED`), and outcome. Movement entries are marked
+`FAILED` if the transaction rolls back. The previous country is a comma-
+separated list if pre-existing output contains the member in multiple tables.
+
+**Phase 6C — validation and reconciliation.** This phase adds
+`AUDIT.SP_VALIDATE_COUNTRY_ROUTING()`. It checks that valid
+current members are routed exactly once to the matching country, detects
+duplicate/orphan/wrong-country and invalid-destination routes, flags
+unapproved country tables and configuration defects, and compares each
+existing approved country table's column structure with `MEMBER_CURRENT`.
+Results are persisted by run and check in
+`AUDIT.COUNTRY_RECONCILIATION_AUDIT`; the procedure returns an overall
+`PASSED` or `FAILED` result and does not repair data.
+
+`TASK_COUNTRY_RECONCILIATION` follows `TASK_COUNTRY_ROUTING`, which remains
+after `TASK_REDEMPTION_PROCESSING`. Both tasks use `SKYPOINTS_ETL_WH`, are
+created suspended, and have no schedule. Manually run the complete graph:
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
 ```
 
-The script resumes descendants in dependency order, executes the existing
-suspended root with `AWAIT`, and suspends descendants again after success.
+The script resumes descendants in reverse dependency order, executes the
+existing suspended root with `AWAIT`, and suspends descendants again after
+success.
 After a failure, inspect task/audit history and suspend descendants manually
 if execution did not reach cleanup. Monitoring queries are in
 [`sql/orchestration/monitor_country_routing.sql`](sql/orchestration/monitor_country_routing.sql).
-They report task history, config and table row-count metadata, routing audit,
-quarantine reasons, and generate an exact reconciliation query for currently
-existing approved country tables. Copy and run that generated SQL in the same
-Snowflake account.
+They report task history, config and table row-count metadata, routing and
+movement audit, reconciliation results, and quarantine reasons. To run
+reconciliation independently, call
+`CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING();` and inspect the
+persistent check rows using the monitor queries.
 
-Country routing remains an account-side Snowflake operation; local tests are
-static and do not establish SQL runtime correctness. Concurrent independent
-manual graph runs are not designed as a supported operating mode. An existing
-country table with a manually altered schema will cause routing to fail rather
-than being silently rewritten.
+Country routing and reconciliation remain account-side Snowflake operations;
+local tests are static and do not establish SQL runtime correctness.
+Reconciliation reports discrepancies without repairing them. Concurrent
+independent manual graph runs are not a supported operating mode. An existing
+country table with a manually altered schema is reported by reconciliation
+and routing SQL failures remain visible.
 
 ## Technology stack
 
@@ -465,7 +496,7 @@ run against an account by the test suite.
 - Empty redemption arrays intentionally produce no transaction rows. A
   document with a missing/non-array `redemptions` property is not expanded
   into a transaction and is not currently quarantined at document level.
-- Curated country analytics products beyond Phase 6A routing and Phase 7
+- Curated country analytics products beyond Phase 6C reconciliation and Phase 7
   scheduling/automation remain out of scope.
 - Task procedures record SQL execution failures in the audit table and
   re-raise them. Platform failures before procedure invocation are available

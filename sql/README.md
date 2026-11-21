@@ -243,7 +243,7 @@ processing, document-level handling for missing/non-array redemption arrays,
 curated analytics products beyond Phase 6A, and Phase 7 scheduling remain out
 of scope.
 
-## Phase 6A: metadata-driven country routing
+## Phase 6A-6C: country routing, movement, and reconciliation
 
 After deploying Phase 3 and Phase 4-5, deploy the country configuration,
 dedicated audit, routing procedure, and suspended downstream task:
@@ -252,15 +252,22 @@ dedicated audit, routing procedure, and suspended downstream task:
 snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
 ```
 
+Then deploy the movement audit, reconciliation procedure/audit, and suspended
+reconciliation task:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/processing/deploy_country_movement_reconciliation.sql
+```
+
 The script seeds the exact approved alpha-3 country list (`USA`, `IND`, `GBR`,
 `CAN`, `AUS`, `DEU`, `FRA`, `JPN`, `SGP`, `NZL`, `ZAF`, `BRA`, `MEX`, `ARE`,
 `SAU`, `KOR`, `ITA`, `ESP`, `NLD`, `CHE`). Its `MERGE` preserves each
 administrator's `IS_ACTIVE` flag and existing target name on redeployment.
 Before routing, the procedure fails closed and records an audit error if it
 finds duplicate codes, missing approved codes, unapproved entries, or target
-names that do not exactly match `MEMBER_<COUNTRY_CODE>`. The procedure uses
-only the allowlist and passes a validated configured identifier through
-Snowflake `IDENTIFIER()` binding.
+names that do not exactly match `MEMBER_<COUNTRY_CODE>`, or null active flags.
+The procedure uses only the allowlist and passes a validated configured
+identifier through Snowflake `IDENTIFIER()` binding.
 
 Country tables are created lazily with `LIKE SKYPOINTS_DB.CORE.MEMBER_CURRENT`
 only for an active approved country with at least one current member. Valid
@@ -278,9 +285,25 @@ An existing country-table row for such a member is preserved until the member
 has a valid destination; rows are still removed when their member no longer
 exists in `MEMBER_CURRENT`.
 
-The task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
-`SKYPOINTS_ETL_WH`, is suspended on deployment, and has no schedule. Manually
-execute the full graph with:
+**Phase 6B — country movement synchronization.** The existing routing
+procedure is also the movement synchronization; there is no duplicate
+movement task. It snapshots prior physical membership and writes
+member-level action/status details to `AUDIT.COUNTRY_MOVEMENT_AUDIT`. The
+previous country is a comma-separated list if pre-existing data has a member
+in multiple country tables. A failed movement transaction marks started audit
+entries `FAILED` after rollback.
+
+**Phase 6C — validation and reconciliation.**
+`AUDIT.SP_VALIDATE_COUNTRY_ROUTING()` performs read-only routing checks for
+valid-current membership, duplicate/orphan/wrong-country rows, invalid
+destinations, unapproved country tables, configuration integrity, and country
+table column compatibility with `CORE.MEMBER_CURRENT`. It stores one result
+per check in `AUDIT.COUNTRY_RECONCILIATION_AUDIT`, returns an overall status,
+and does not repair discrepancies.
+
+`TASK_COUNTRY_RECONCILIATION` follows `TASK_COUNTRY_ROUTING`; the routing task
+remains after `TASK_REDEMPTION_PROCESSING`. Both use `SKYPOINTS_ETL_WH`, are
+suspended on deployment, and have no schedule. Manually execute the full graph:
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
@@ -296,23 +319,25 @@ snow sql --connection <connection_name> --filename sql/orchestration/monitor_cou
 ```
 
 The monitor script shows task history, configuration and table row-count
-metadata, routing audit history, and routing quarantine reasons. It also
-generates a reconciliation SQL statement for existing approved country
-tables; copy that generated statement into a worksheet and execute it to
-check one-to-one routing, wrong-country rows, duplicates, and invalid-country
-routes.
+metadata, routing and movement audit history, reconciliation checks, and
+routing quarantine reasons. Reconciliation can also be run independently:
 
-Phase 6A tests are static contract tests only:
+```sql
+CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING();
+```
+
+Phase 6A-6C tests are static contract tests only:
 
 ```powershell
-python -m pytest -q tests/test_phase6_country_routing.py
+python -m pytest -q tests/test_phase6_country_routing.py tests/test_phase6bc_country_movement_reconciliation.py
 ```
 
 Live Snowflake verification is required for DDL/procedure compilation,
-`IDENTIFIER()` binding, task ownership, transaction behavior, and exact
-reconciliation results. Concurrent independent graph runs are not a supported
-operating mode. Existing country tables with manually changed schemas are not
-altered automatically and cause SQL operations to fail visibly.
+`IDENTIFIER()` binding, task ownership, transaction behavior, and
+reconciliation results. Reconciliation reports but does not repair
+discrepancies. Concurrent independent graph runs are not a supported operating
+mode. Existing country tables with manually changed schemas are not altered
+automatically.
 
 ## Phase 2 infrastructure reference (already provisioned)
 

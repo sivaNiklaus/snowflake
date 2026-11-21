@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_AUDIT
 )
 COMMENT = 'Per-execution country routing audit and operation counts';
 
+CREATE TABLE IF NOT EXISTS SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT
+(
+    RUN_ID VARCHAR NOT NULL,
+    MEMBER_ID VARCHAR NOT NULL,
+    PREVIOUS_COUNTRY VARCHAR,
+    DESTINATION_COUNTRY VARCHAR,
+    ACTION VARCHAR NOT NULL,
+    STATUS VARCHAR NOT NULL,
+    ERROR_DETAILS VARCHAR,
+    CREATED_AT TIMESTAMP_LTZ NOT NULL,
+    UPDATED_AT TIMESTAMP_LTZ NOT NULL,
+    PRIMARY KEY (RUN_ID, MEMBER_ID)
+)
+COMMENT = 'Per-member country movement synchronization outcomes';
+
 CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.CORE.SP_ROUTE_MEMBERS_BY_COUNTRY()
 RETURNS VARIANT
 LANGUAGE SQL
@@ -73,6 +88,7 @@ DECLARE
     v_missing_config_count NUMBER(38, 0) DEFAULT 0;
     v_unapproved_config_count NUMBER(38, 0) DEFAULT 0;
     v_invalid_target_count NUMBER(38, 0) DEFAULT 0;
+    v_null_active_count NUMBER(38, 0) DEFAULT 0;
     v_config_error VARCHAR;
     v_country_code VARCHAR(3);
     v_target_table VARCHAR;
@@ -179,11 +195,17 @@ BEGIN
       FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
      WHERE TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE);
 
+    SELECT COUNT(*)
+      INTO :v_null_active_count
+      FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
+     WHERE IS_ACTIVE IS NULL;
+
     IF (
         v_duplicate_config_count > 0
         OR v_missing_config_count > 0
         OR v_unapproved_config_count > 0
         OR v_invalid_target_count > 0
+        OR v_null_active_count > 0
     ) THEN
         v_config_error :=
             'Country routing configuration validation failed: duplicate_country_codes='
@@ -193,7 +215,9 @@ BEGIN
             || ', unapproved_country_codes='
             || v_unapproved_config_count
             || ', invalid_target_table_names='
-            || v_invalid_target_count;
+            || v_invalid_target_count
+            || ', null_is_active_values='
+            || v_null_active_count;
         RAISE e_invalid_country_config;
     END IF;
 
@@ -256,6 +280,95 @@ BEGIN
     SELECT COUNT(*), COALESCE(COUNT_IF(FAILURE_REASON IS NOT NULL), 0)
       INTO :v_total_members, :v_quarantined_count
       FROM SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS;
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_ROUTING_PRIOR_MEMBERS
+    (
+        MEMBER_ID VARCHAR,
+        COUNTRY_CODE VARCHAR(3) NOT NULL
+    );
+
+    OPEN c_configured_countries;
+    FETCH c_configured_countries INTO v_country_code, v_target_table;
+    WHILE (v_country_code IS NOT NULL) DO
+        v_target_fqn := 'SKYPOINTS_DB.CORE.' || v_target_table;
+
+        SELECT COUNT(*)
+          INTO :v_table_exists
+          FROM SKYPOINTS_DB.INFORMATION_SCHEMA.TABLES
+         WHERE TABLE_SCHEMA = 'CORE'
+           AND TABLE_NAME = :v_target_table
+           AND TABLE_TYPE = 'BASE TABLE';
+
+        IF (v_table_exists > 0) THEN
+            INSERT INTO SKYPOINTS_DB.CORE.COUNTRY_ROUTING_PRIOR_MEMBERS
+            (
+                MEMBER_ID, COUNTRY_CODE
+            )
+            SELECT MEMBER_ID, :v_country_code
+            FROM IDENTIFIER(:v_target_fqn);
+        END IF;
+
+        FETCH c_configured_countries INTO v_country_code, v_target_table;
+    END WHILE;
+    CLOSE c_configured_countries;
+
+    CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_DB.CORE.COUNTRY_MOVEMENT_WORK AS
+    SELECT
+        decisions.MEMBER_ID,
+        LISTAGG(DISTINCT prior.COUNTRY_CODE, ',')
+            WITHIN GROUP (ORDER BY prior.COUNTRY_CODE) AS PREVIOUS_COUNTRY,
+        decisions.NORMALIZED_COUNTRY AS DESTINATION_COUNTRY,
+        CASE
+            WHEN decisions.FAILURE_REASON IS NOT NULL THEN 'QUARANTINED'
+            WHEN COALESCE(COUNT_IF(
+                prior.MEMBER_ID IS NOT NULL
+                AND prior.COUNTRY_CODE IS DISTINCT FROM decisions.NORMALIZED_COUNTRY
+            ), 0) > 0 THEN 'MOVED'
+            WHEN COUNT(prior.MEMBER_ID) = 0 THEN 'INSERTED'
+            ELSE 'SYNCHRONIZED'
+        END AS ACTION,
+        decisions.FAILURE_REASON
+    FROM SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS AS decisions
+    LEFT JOIN SKYPOINTS_DB.CORE.COUNTRY_ROUTING_PRIOR_MEMBERS AS prior
+      ON prior.MEMBER_ID = decisions.MEMBER_ID
+    GROUP BY
+        decisions.MEMBER_ID,
+        decisions.NORMALIZED_COUNTRY,
+        decisions.FAILURE_REASON;
+
+    MERGE INTO SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT AS target
+    USING
+    (
+        SELECT
+            :v_run_id AS RUN_ID,
+            MEMBER_ID,
+            PREVIOUS_COUNTRY,
+            DESTINATION_COUNTRY,
+            ACTION,
+            IFF(ACTION = 'QUARANTINED', 'QUARANTINED', 'STARTED') AS STATUS,
+            FAILURE_REASON AS ERROR_DETAILS
+        FROM SKYPOINTS_DB.CORE.COUNTRY_MOVEMENT_WORK
+    ) AS source
+       ON target.RUN_ID = source.RUN_ID
+      AND target.MEMBER_ID = source.MEMBER_ID
+    WHEN MATCHED THEN UPDATE SET
+        PREVIOUS_COUNTRY = source.PREVIOUS_COUNTRY,
+        DESTINATION_COUNTRY = source.DESTINATION_COUNTRY,
+        ACTION = source.ACTION,
+        STATUS = source.STATUS,
+        ERROR_DETAILS = source.ERROR_DETAILS,
+        UPDATED_AT = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN INSERT
+    (
+        RUN_ID, MEMBER_ID, PREVIOUS_COUNTRY, DESTINATION_COUNTRY,
+        ACTION, STATUS, ERROR_DETAILS, CREATED_AT, UPDATED_AT
+    )
+    VALUES
+    (
+        source.RUN_ID, source.MEMBER_ID, source.PREVIOUS_COUNTRY,
+        source.DESTINATION_COUNTRY, source.ACTION, source.STATUS,
+        source.ERROR_DETAILS, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+    );
 
     MERGE INTO SKYPOINTS_DB.STAGING.DQ_QUARANTINE AS target
     USING
@@ -485,6 +598,12 @@ BEGIN
     END WHILE;
     CLOSE c_configured_countries;
 
+    UPDATE SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT
+       SET STATUS = 'SUCCEEDED',
+           UPDATED_AT = CURRENT_TIMESTAMP()
+     WHERE RUN_ID = :v_run_id
+       AND STATUS = 'STARTED';
+
     COMMIT;
     v_transaction_started := FALSE;
 
@@ -529,6 +648,12 @@ EXCEPTION
                QUARANTINED_COUNT = :v_quarantined_count,
                ERROR_DETAILS = COALESCE(:v_config_error, :SQLERRM)
          WHERE RUN_ID = :v_run_id;
+        UPDATE SKYPOINTS_DB.AUDIT.COUNTRY_MOVEMENT_AUDIT
+           SET STATUS = 'FAILED',
+               ERROR_DETAILS = :SQLERRM,
+               UPDATED_AT = CURRENT_TIMESTAMP()
+         WHERE RUN_ID = :v_run_id
+           AND STATUS = 'STARTED';
         RAISE;
 END;
 $$;

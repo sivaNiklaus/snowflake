@@ -50,6 +50,7 @@ def test_invalid_target_names_fail_before_identifier_usage_and_are_audited() -> 
     assert "v_missing_config_count > 0" in ROUTING_DEPLOYMENT
     assert "v_unapproved_config_count > 0" in ROUTING_DEPLOYMENT
     assert "v_invalid_target_count > 0" in ROUTING_DEPLOYMENT
+    assert "v_null_active_count > 0" in ROUTING_DEPLOYMENT
     assert "TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE)" in ROUTING_DEPLOYMENT
     assert "RAISE e_invalid_country_config;" in ROUTING_DEPLOYMENT
     assert (
@@ -95,8 +96,8 @@ def test_routing_iterates_cursors_without_record_field_dereferences() -> None:
     ) == 4
     assert ROUTING_DEPLOYMENT.count(
         "FETCH c_configured_countries INTO v_country_code, v_target_table"
-    ) == 2
-    assert ROUTING_DEPLOYMENT.count("WHILE (v_country_code IS NOT NULL) DO") == 3
+    ) == 4
+    assert ROUTING_DEPLOYMENT.count("WHILE (v_country_code IS NOT NULL) DO") == 4
     assert "route_country.COUNTRY_CODE" not in ROUTING_DEPLOYMENT
     assert "configured_country.COUNTRY_CODE" not in ROUTING_DEPLOYMENT
 
