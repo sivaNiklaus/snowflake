@@ -65,6 +65,20 @@ def test_redemptions_flatten_preserve_lineage_and_ignore_empty_arrays() -> None:
     assert "OUTER => TRUE" not in DEPLOYMENT.upper()
 
 
+def test_parse_procedure_uses_supported_select_into_statements() -> None:
+    parse_procedure = DEPLOYMENT.split(
+        "CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.STAGING.SP_PARSE_AND_NORMALIZE()",
+        1,
+    )[1].split(
+        "CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.STAGING.SP_RUN_DQ_VALIDATION()",
+        1,
+    )[0]
+    assert "SELECT COUNT(*)\n      INTO :v_member_rows" in parse_procedure
+    assert "SELECT COUNT(*)\n      INTO :v_redemption_rows" in parse_procedure
+    assert "v_rows_processed := v_member_rows + v_redemption_rows;" in parse_procedure
+    assert "SELECT\n        (SELECT COUNT(*)" not in parse_procedure
+
+
 def test_metadata_seeds_every_supported_dq_rule_and_maps_controlled_types() -> None:
     rules = (
         "MEMBER_ID_NOT_NULL",
