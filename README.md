@@ -3,8 +3,8 @@
 SkyPoints ETL is a Snowflake-based data platform for loyalty-member profiles
 and partner-airline redemption transactions. It contains the Phase 1
 foundation, Phase 2 S3/Snowflake access infrastructure, Phase 3 raw ingestion,
-and the combined **Phase 4-5: metadata-driven DQ and business processing**
-task graph.
+the combined **Phase 4-5: metadata-driven DQ and business processing** task
+graph, and **Phase 6A: metadata-driven country routing**.
 
 ## Business problem
 
@@ -139,6 +139,77 @@ for task history, procedure audits, DQ counts, rule outcomes, quarantine, and
 core referential-integrity queries. Monitoring and execution remain separate
 from deployment. Static tests do not deploy or execute SQL against Snowflake.
 
+## Phase 6A: metadata-driven country routing
+
+Phase 6A routes current `CORE.MEMBER_CURRENT` rows into lazily created
+`CORE.MEMBER_<COUNTRY_CODE>` outputs. The routing configuration and audit
+tables are in `AUDIT`; invalid or inactive destinations are recorded in the
+existing `STAGING.DQ_QUARANTINE` structure. The router does not change
+`MEMBER_HISTORY` or take over Phase 4-5 SCD Type 2 processing.
+
+Deploy Phase 6A after Phase 3 and Phase 4-5:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
+```
+
+`AUDIT.COUNTRY_ROUTING_CONFIG` is seeded idempotently with exactly these
+approved ISO 3166-1 alpha-3 codes:
+
+```text
+USA, IND, GBR, CAN, AUS, DEU, FRA, JPN, SGP, NZL,
+ZAF, BRA, MEX, ARE, SAU, KOR, ITA, ESP, NLD, CHE
+```
+
+Redeployment canonicalizes each `TARGET_TABLE` to `MEMBER_<COUNTRY_CODE>` but
+preserves administrator changes to `IS_ACTIVE`. Codes outside this allowlist
+are never routed, even if an extra configuration row is added manually.
+Country tables are created only when an approved, active country has current
+members; each new table is created `LIKE CORE.MEMBER_CURRENT`. Routing uses
+the configured target only after checking the country allowlist and canonical
+table-name pattern, then uses Snowflake `IDENTIFIER()` binding for the
+identifier.
+
+On each run the router normalizes country codes with `TRIM` and `UPPER`,
+routes only approved active countries, and quarantines missing,
+unsupported, or inactive countries as `MISSING_COUNTRY`, `UNSUPPORTED_COUNTRY`,
+or `INACTIVE_COUNTRY`. The quarantine row retains the source record and a
+variant snapshot of all current member columns. A stable member/reason key
+makes repeated quarantine merges idempotent.
+
+For country movement, the procedure validates destinations, creates needed
+tables, and merges valid current member rows before deleting stale rows from
+other country outputs. The merges and cleanup are one transaction: an insert
+or update failure rolls back country-output changes and preserves the prior
+country copy. Invalid destinations are quarantined and are not routed; their
+old output rows are removed as part of the same successful cleanup. Each
+execution is recorded in `AUDIT.COUNTRY_ROUTING_AUDIT`, including inserted,
+updated, removed, routed, quarantined, and failed-run counts.
+
+The new task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
+`SKYPOINTS_ETL_WH`, is created suspended, and adds no schedule. Manually run
+the complete graph:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
+```
+
+The script resumes descendants in dependency order, executes the existing
+suspended root with `AWAIT`, and suspends descendants again after success.
+After a failure, inspect task/audit history and suspend descendants manually
+if execution did not reach cleanup. Monitoring queries are in
+[`sql/orchestration/monitor_country_routing.sql`](sql/orchestration/monitor_country_routing.sql).
+They report task history, config and table row-count metadata, routing audit,
+quarantine reasons, and generate an exact reconciliation query for currently
+existing approved country tables. Copy and run that generated SQL in the same
+Snowflake account.
+
+Country routing remains an account-side Snowflake operation; local tests are
+static and do not establish SQL runtime correctness. Concurrent independent
+manual graph runs are not designed as a supported operating mode. An existing
+country table with a manually altered schema will cause routing to fail rather
+than being silently rewritten.
+
 ## Technology stack
 
 - **Snowflake** for the planned data platform.
@@ -170,13 +241,16 @@ from deployment. Static tests do not deploy or execute SQL against Snowflake.
 │   │   ├── validate_member_profile.sql
 │   │   └── validate_redemption.sql
 │   ├── processing/
-│   │   └── deploy_ingestion_dq_and_business_transformation.sql
+│   │   ├── deploy_ingestion_dq_and_business_transformation.sql
+│   │   └── deploy_country_routing.sql
 │   └── orchestration/
 │       ├── deploy_ingestion_task_graph.sql
 │       ├── execute_ingestion_task_graph.sql
 │       ├── execute_ingestion_dq_and_business_transformation.sql
+│       ├── execute_country_routing.sql
 │       ├── monitor_ingestion_task_graph.sql
-│       └── monitor_ingestion_dq_and_business_transformation.sql
+│       ├── monitor_ingestion_dq_and_business_transformation.sql
+│       └── monitor_country_routing.sql
 ├── sources/
 │   └── definitions/
 │       ├── 01_foundation.sql
@@ -191,6 +265,7 @@ from deployment. Static tests do not deploy or execute SQL against Snowflake.
 │   ├── test_raw_ingestion.py
 │   ├── test_task_graph.py
 │   ├── test_phase45_static.py
+│   ├── test_phase6_country_routing.py
 │   └── fixtures/
 │       ├── members/member_sample.dat
 │       └── redemptions/redemption_sample.json
@@ -337,10 +412,10 @@ execution is performed by the local static tests.
    external stages.
 3. **Raw data ingestion:** task-graph orchestration, raw-table validation, and
    operational task auditing.
-4-5. **Metadata-driven DQ and business processing (current):** parsing,
+4-5. **Metadata-driven DQ and business processing:** parsing,
    validation, quarantine, member current/history, and redemption facts.
-6. **Country-specific outputs:** curated tables and analytics interfaces; out
-   of scope for the current phase.
+6A. **Metadata-driven country routing (current):** approved-country member
+   outputs; curated analytics products remain future work.
 7. **Scale and operations:** scheduling, workload tuning, backfills, and
    operational automation; out of scope for the current phase.
 
@@ -386,8 +461,8 @@ run against an account by the test suite.
 - Empty redemption arrays intentionally produce no transaction rows. A
   document with a missing/non-array `redemptions` property is not expanded
   into a transaction and is not currently quarantined at document level.
-- Phase 6 country-specific outputs and Phase 7 scheduling/automation remain
-  out of scope.
+- Curated country analytics products beyond Phase 6A routing and Phase 7
+  scheduling/automation remain out of scope.
 - Task procedures record SQL execution failures in the audit table and
   re-raise them. Platform failures before procedure invocation are available
   through Snowflake task history.

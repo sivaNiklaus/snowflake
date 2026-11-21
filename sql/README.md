@@ -240,7 +240,74 @@ deploy or execute these scripts against a live Snowflake account. Status
 values (`COMPLETED`/`PENDING`) and active flags (`A`/`I`) are based on the
 supplied sample and should be confirmed with source owners. Incremental
 processing, document-level handling for missing/non-array redemption arrays,
-country-specific Phase 6 outputs, and Phase 7 scheduling remain out of scope.
+curated analytics products beyond Phase 6A, and Phase 7 scheduling remain out
+of scope.
+
+## Phase 6A: metadata-driven country routing
+
+After deploying Phase 3 and Phase 4-5, deploy the country configuration,
+dedicated audit, routing procedure, and suspended downstream task:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/processing/deploy_country_routing.sql
+```
+
+The script seeds the exact approved alpha-3 country list (`USA`, `IND`, `GBR`,
+`CAN`, `AUS`, `DEU`, `FRA`, `JPN`, `SGP`, `NZL`, `ZAF`, `BRA`, `MEX`, `ARE`,
+`SAU`, `KOR`, `ITA`, `ESP`, `NLD`, `CHE`). Its `MERGE` preserves each
+administrator's `IS_ACTIVE` flag on redeployment and canonicalizes target
+names to `MEMBER_<COUNTRY_CODE>`. The procedure uses only this allowlist,
+validates the configured target pattern, and passes the resulting configured
+identifier through Snowflake `IDENTIFIER()` binding.
+
+Country tables are created lazily with `LIKE SKYPOINTS_DB.CORE.MEMBER_CURRENT`
+only for an active approved country with at least one current member. Valid
+current records are merged first. Within one transaction, obsolete rows are
+then removed from other country tables. A failed merge rolls back the output
+changes, preserving the previous route. `MEMBER_HISTORY` is read by no routing
+mutation and remains exclusively maintained by Phase 4-5.
+
+Missing, unsupported, and inactive country destinations are not routed.
+Instead, one idempotent record per member/routing condition is merged into
+the existing `STAGING.DQ_QUARANTINE` table under dataset `MEMBER_ROUTING`, with
+the original source line, a full current-member JSON snapshot, and the reason
+`MISSING_COUNTRY`, `UNSUPPORTED_COUNTRY`, or `INACTIVE_COUNTRY`.
+
+The task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
+`SKYPOINTS_ETL_WH`, is suspended on deployment, and has no schedule. Manually
+execute the full graph with:
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/execute_country_routing.sql
+```
+
+The script resumes descendants in reverse dependency order, invokes the
+existing suspended member-ingestion root with `AWAIT`, and suspends the
+descendants after success. If a failure prevents cleanup, suspend descendants
+manually after reviewing task history.
+
+```powershell
+snow sql --connection <connection_name> --filename sql/orchestration/monitor_country_routing.sql
+```
+
+The monitor script shows task history, configuration and table row-count
+metadata, routing audit history, and routing quarantine reasons. It also
+generates a reconciliation SQL statement for existing approved country
+tables; copy that generated statement into a worksheet and execute it to
+check one-to-one routing, wrong-country rows, duplicates, and invalid-country
+routes.
+
+Phase 6A tests are static contract tests only:
+
+```powershell
+python -m pytest -q tests/test_phase6_country_routing.py
+```
+
+Live Snowflake verification is required for DDL/procedure compilation,
+`IDENTIFIER()` binding, task ownership, transaction behavior, and exact
+reconciliation results. Concurrent independent graph runs are not a supported
+operating mode. Existing country tables with manually changed schemas are not
+altered automatically and cause SQL operations to fail visibly.
 
 ## Phase 2 infrastructure reference (already provisioned)
 

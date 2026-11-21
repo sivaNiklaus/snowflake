@@ -1,0 +1,140 @@
+-- Recent execution history for the complete Phase 3-6A task graph.
+SELECT
+    NAME,
+    STATE,
+    GRAPH_RUN_GROUP_ID,
+    SCHEDULED_TIME,
+    QUERY_START_TIME,
+    COMPLETED_TIME,
+    ERROR_MESSAGE
+FROM TABLE(SKYPOINTS_DB.INFORMATION_SCHEMA.TASK_HISTORY(
+    SCHEDULED_TIME_RANGE_START => DATEADD('DAY', -7, CURRENT_TIMESTAMP()),
+    SCHEDULED_TIME_RANGE_END => CURRENT_TIMESTAMP(),
+    DATABASE_NAME => 'SKYPOINTS_DB',
+    SCHEMA_NAME => 'RAW',
+    RESULT_LIMIT => 1000
+))
+WHERE NAME IN
+(
+    'TASK_MEMBER_INGESTION',
+    'TASK_REDEMPTION_INGESTION',
+    'TASK_INGESTION_VALIDATION',
+    'TASK_PARSE_AND_NORMALIZE',
+    'TASK_DQ_VALIDATION',
+    'TASK_MEMBER_PROCESSING',
+    'TASK_REDEMPTION_PROCESSING',
+    'TASK_COUNTRY_ROUTING'
+)
+ORDER BY SCHEDULED_TIME DESC;
+
+-- Country configuration and physical row-count metadata for created tables.
+SELECT
+    config.COUNTRY_CODE,
+    config.TARGET_TABLE,
+    config.IS_ACTIVE,
+    COALESCE(tables.ROW_COUNT, 0) AS TABLE_ROW_COUNT,
+    tables.LAST_ALTERED
+FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
+LEFT JOIN SKYPOINTS_DB.INFORMATION_SCHEMA.TABLES AS tables
+  ON tables.TABLE_SCHEMA = 'CORE'
+ AND tables.TABLE_NAME = config.TARGET_TABLE
+ AND tables.TABLE_TYPE = 'BASE TABLE'
+ORDER BY config.COUNTRY_CODE;
+
+-- Country routing run outcomes and operation counts.
+SELECT
+    RUN_ID,
+    STARTED_AT,
+    ENDED_AT,
+    STATUS,
+    TOTAL_MEMBERS,
+    ROUTED_MEMBERS,
+    INSERTED_COUNT,
+    UPDATED_COUNT,
+    REMOVED_COUNT,
+    QUARANTINED_COUNT,
+    ERROR_DETAILS
+FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_AUDIT
+ORDER BY STARTED_AT DESC
+LIMIT 100;
+
+-- Routing failure reasons retained in the existing DQ quarantine table.
+SELECT
+    failures.VALUE:message::VARCHAR AS FAILURE_REASON,
+    COUNT(*) AS QUARANTINED_RECORDS,
+    MIN(quarantine.QUARANTINED_AT) AS FIRST_QUARANTINED_AT,
+    MAX(quarantine.QUARANTINED_AT) AS LAST_QUARANTINED_AT
+FROM SKYPOINTS_DB.STAGING.DQ_QUARANTINE AS quarantine,
+     LATERAL FLATTEN(INPUT => quarantine.FAILURE_REASONS) AS failures
+WHERE quarantine.DATASET_NAME = 'MEMBER_ROUTING'
+  AND failures.VALUE:message::VARCHAR IN
+      ('UNSUPPORTED_COUNTRY', 'INACTIVE_COUNTRY', 'MISSING_COUNTRY')
+GROUP BY failures.VALUE:message::VARCHAR
+ORDER BY FAILURE_REASON;
+
+-- Generate an exact reconciliation query for currently existing, approved
+-- country tables. Copy and run the returned SQL text in the same account.
+WITH approved_tables AS
+(
+    SELECT config.COUNTRY_CODE, config.TARGET_TABLE
+    FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config
+    JOIN SKYPOINTS_DB.INFORMATION_SCHEMA.TABLES AS tables
+      ON tables.TABLE_SCHEMA = 'CORE'
+     AND tables.TABLE_NAME = config.TARGET_TABLE
+     AND tables.TABLE_TYPE = 'BASE TABLE'
+    WHERE config.COUNTRY_CODE IN
+    (
+        'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
+        'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
+    )
+      AND config.TARGET_TABLE = 'MEMBER_' || config.COUNTRY_CODE
+)
+SELECT
+    'WITH routed AS ('
+    || COALESCE(
+        LISTAGG(
+            'SELECT ''' || COUNTRY_CODE
+            || '''::VARCHAR(3) AS COUNTRY_CODE, MEMBER_ID '
+            || 'FROM SKYPOINTS_DB.CORE.' || TARGET_TABLE,
+            ' UNION ALL '
+        ) WITHIN GROUP (ORDER BY COUNTRY_CODE),
+        'SELECT NULL::VARCHAR(3) AS COUNTRY_CODE, '
+        || 'NULL::VARCHAR AS MEMBER_ID WHERE FALSE'
+    )
+    || '), valid_current AS ('
+    || 'SELECT member.MEMBER_ID, UPPER(TRIM(member.COUNTRY)) AS COUNTRY_CODE '
+    || 'FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
+    || 'JOIN SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config '
+    || 'ON config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY)) '
+    || 'AND config.IS_ACTIVE '
+    || 'WHERE config.COUNTRY_CODE IN '
+    || '(''USA'',''IND'',''GBR'',''CAN'',''AUS'',''DEU'',''FRA'',''JPN'','
+    || '''SGP'',''NZL'',''ZAF'',''BRA'',''MEX'',''ARE'',''SAU'',''KOR'','
+    || '''ITA'',''ESP'',''NLD'',''CHE'')'
+    || ') SELECT '
+    || '(SELECT COALESCE(COUNT_IF(route_count <> 1 OR matching_count <> 1), 0) '
+    || 'FROM (SELECT current_member.MEMBER_ID, COUNT(routed.MEMBER_ID) AS route_count, '
+    || 'COALESCE(COUNT_IF(routed.COUNTRY_CODE = current_member.COUNTRY_CODE), 0) AS matching_count '
+    || 'FROM valid_current AS current_member LEFT JOIN routed '
+    || 'ON routed.MEMBER_ID = current_member.MEMBER_ID '
+    || 'GROUP BY current_member.MEMBER_ID) AS member_route_counts)) '
+    || 'AS VALID_CURRENT_NOT_ROUTED_EXACTLY_ONCE, '
+    || '(SELECT COUNT(*) FROM (SELECT MEMBER_ID FROM routed '
+    || 'GROUP BY MEMBER_ID HAVING COUNT(*) > 1) AS duplicated_routes) '
+    || 'AS MEMBER_IDS_DUPLICATED_ACROSS_COUNTRY_TABLES, '
+    || '(SELECT COUNT(*) FROM routed '
+    || 'LEFT JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
+    || 'ON member.MEMBER_ID = routed.MEMBER_ID '
+    || 'WHERE member.MEMBER_ID IS NULL OR routed.COUNTRY_CODE '
+    || 'IS DISTINCT FROM UPPER(TRIM(member.COUNTRY))) '
+    || 'AS MEMBERS_IN_WRONG_COUNTRY_TABLE, '
+    || '(SELECT COUNT(*) FROM routed '
+    || 'JOIN SKYPOINTS_DB.CORE.MEMBER_CURRENT AS member '
+    || 'ON member.MEMBER_ID = routed.MEMBER_ID '
+    || 'LEFT JOIN SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS config '
+    || 'ON config.COUNTRY_CODE = UPPER(TRIM(member.COUNTRY)) '
+    || 'AND config.IS_ACTIVE '
+    || 'WHERE UPPER(TRIM(member.COUNTRY)) IS NULL OR config.COUNTRY_CODE IS NULL) '
+    || 'AS UNSUPPORTED_INACTIVE_OR_MISSING_MEMBERS_ROUTED;'
+    AS RECONCILIATION_SQL
+FROM approved_tables;
