@@ -147,9 +147,14 @@ SELECT
     reconciliation.CHECK_COUNT,
     reconciliation.FAILED_CHECK_COUNT,
     IFF(
-        reconciliation.CHECK_COUNT IS NULL,
+        reconciliation.RUN_ID IS NULL,
         'NOT_RECORDED',
-        IFF(reconciliation.FAILED_CHECK_COUNT = 0, 'PASSED', 'FAILED')
+        IFF(
+            reconciliation.EXECUTION_FAILED_COUNT > 0
+                OR reconciliation.FAILED_CHECK_COUNT > 0,
+            'FAILED',
+            IFF(reconciliation.CHECK_COUNT = 0, 'NOT_RECORDED', 'PASSED')
+        )
     ) AS RECONCILIATION_STATUS,
     routing.ERROR_DETAILS
 FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_AUDIT AS routing
@@ -157,8 +162,24 @@ LEFT JOIN
 (
     SELECT
         RUN_ID,
-        COUNT(*) AS CHECK_COUNT,
-        COUNT_IF(STATUS = 'FAILED') AS FAILED_CHECK_COUNT
+        COALESCE(
+            COUNT_IF(CHECK_NAME <> 'RECONCILIATION_EXECUTION'),
+            0
+        ) AS CHECK_COUNT,
+        COALESCE(
+            COUNT_IF(
+                CHECK_NAME <> 'RECONCILIATION_EXECUTION'
+                AND STATUS = 'FAILED'
+            ),
+            0
+        ) AS FAILED_CHECK_COUNT,
+        COALESCE(
+            COUNT_IF(
+                CHECK_NAME = 'RECONCILIATION_EXECUTION'
+                AND STATUS = 'FAILED'
+            ),
+            0
+        ) AS EXECUTION_FAILED_COUNT
     FROM SKYPOINTS_DB.AUDIT.COUNTRY_RECONCILIATION_AUDIT
     GROUP BY RUN_ID
 ) AS reconciliation

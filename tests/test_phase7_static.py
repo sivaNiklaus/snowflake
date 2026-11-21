@@ -228,6 +228,53 @@ def test_per_run_quarantine_counts_ignore_historical_quarantine_rows() -> None:
     assert "ALL_QUARANTINED_RECORDS" in PIPELINE_MONITORING
 
 
+def test_reconciliation_monitor_excludes_execution_errors_from_check_counts() -> None:
+    reconciliation_query = PIPELINE_MONITORING.split(
+        "-- Country operation counts", 1
+    )[1].split(
+        "-- Failure drill-down", 1
+    )[0]
+    aggregation = reconciliation_query.split(
+        "SELECT\n        RUN_ID,", 1
+    )[1].split(
+        ") AS reconciliation", 1
+    )[0]
+
+    assert (
+        "COUNT_IF(CHECK_NAME <> 'RECONCILIATION_EXECUTION')" in aggregation
+    )
+    assert (
+        "CHECK_NAME <> 'RECONCILIATION_EXECUTION'\n"
+        "                AND STATUS = 'FAILED'"
+    ) in aggregation
+    assert (
+        "CHECK_NAME = 'RECONCILIATION_EXECUTION'\n"
+        "                AND STATUS = 'FAILED'"
+    ) in aggregation
+
+
+def test_reconciliation_monitor_counts_individual_failures_only() -> None:
+    assert re.search(
+        r"COALESCE\(\s*COUNT_IF\(\s*"
+        r"CHECK_NAME <> 'RECONCILIATION_EXECUTION'\s+"
+        r"AND STATUS = 'FAILED'\s*\),\s*0\s*\) AS FAILED_CHECK_COUNT",
+        PIPELINE_MONITORING,
+    )
+
+
+def test_reconciliation_execution_failure_forces_failed_overall_status() -> None:
+    reconciliation_query = PIPELINE_MONITORING.split(
+        "-- Country operation counts", 1
+    )[1].split(
+        "-- Failure drill-down", 1
+    )[0]
+
+    assert "reconciliation.EXECUTION_FAILED_COUNT > 0" in reconciliation_query
+    assert "OR reconciliation.FAILED_CHECK_COUNT > 0" in reconciliation_query
+    assert "'FAILED'" in reconciliation_query
+    assert "reconciliation.RUN_ID IS NULL" in reconciliation_query
+
+
 def test_phase7_documentation_covers_run_recovery_and_snowflake_limits() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     sql_readme = (ROOT / "sql" / "README.md").read_text(encoding="utf-8")
