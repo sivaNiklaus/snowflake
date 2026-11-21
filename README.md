@@ -215,8 +215,10 @@ duplicate/orphan/wrong-country and invalid-destination routes, flags
 unapproved country tables and configuration defects, and compares each
 existing approved country table's column structure with `MEMBER_CURRENT`.
 Results are persisted by run and check in
-`AUDIT.COUNTRY_RECONCILIATION_AUDIT`; the procedure returns an overall
-`PASSED` or `FAILED` result and does not repair data.
+`AUDIT.COUNTRY_RECONCILIATION_AUDIT`; a clean run returns `PASSED`. If any
+check fails, the procedure preserves the individual check rows and raises an
+error, causing the reconciliation task and complete graph to fail. The
+procedure does not repair data.
 
 `TASK_COUNTRY_RECONCILIATION` follows `TASK_COUNTRY_ROUTING`, which remains
 after `TASK_REDEMPTION_PROCESSING`. Both tasks use `SKYPOINTS_ETL_WH`, are
@@ -236,8 +238,9 @@ Phase 6-specific monitoring queries remain in
 They report task history, config and table row-count metadata, routing and
 movement audit, reconciliation results, and quarantine reasons. To run
 reconciliation independently, call
-`CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING();` and inspect the
-persistent check rows using the monitor queries.
+`CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING();` and inspect
+`AUDIT.COUNTRY_RECONCILIATION_AUDIT`; a failed check raises after its results
+are persisted.
 
 Country routing and reconciliation remain account-side Snowflake operations;
 local tests are static and do not establish SQL runtime correctness.
@@ -293,8 +296,9 @@ active in task history and suspend descendants; only then may an operator
 clear the stale control row and record the manual intervention.
 
 The consolidated monitor includes pipeline/task history, ingestion files and
-rows, stage checkpoints, DQ and quarantine counts, current core totals, country
-movement counts, reconciliation results, and failed-task details:
+rows, stage checkpoints, per-run DQ/quarantine counts (distinct failed records
+from that run's rule results), lifetime quarantine totals, current core totals,
+country movement counts, reconciliation results, and failed-task details:
 
 ```powershell
 snow sql --connection <connection_name> --filename sql/orchestration/monitor_unified_pipeline.sql

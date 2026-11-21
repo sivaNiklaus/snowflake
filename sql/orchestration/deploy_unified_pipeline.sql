@@ -120,6 +120,7 @@ DECLARE
     v_failed_task_count NUMBER(38, 0) DEFAULT 0;
     v_failed_tasks VARCHAR;
     v_task_errors VARCHAR;
+    v_reconciliation_error VARCHAR;
     v_cleanup_errors VARCHAR;
     v_error_details VARCHAR;
 BEGIN
@@ -321,6 +322,37 @@ EXCEPTION
                     WHEN OTHER THEN
                         v_task_errors := 'Could not read failed task history: ' || SQLERRM;
                 END;
+            END IF;
+
+            IF (v_graph_run_id IS NOT NULL AND v_graph_run_id <> v_run_id) THEN
+                BEGIN
+                    SELECT MAX(ERROR_DETAILS)
+                      INTO :v_reconciliation_error
+                      FROM SKYPOINTS_DB.AUDIT.COUNTRY_RECONCILIATION_AUDIT
+                     WHERE RUN_ID = :v_graph_run_id
+                       AND CHECK_NAME = 'RECONCILIATION_EXECUTION'
+                       AND STATUS = 'FAILED';
+                EXCEPTION
+                    WHEN OTHER THEN
+                        v_reconciliation_error :=
+                            'Could not read reconciliation audit: ' || SQLERRM;
+                END;
+            END IF;
+
+            IF (v_reconciliation_error IS NOT NULL) THEN
+                v_task_errors := COALESCE(v_task_errors || '; ', '')
+                    || 'COUNTRY_RECONCILIATION=' || v_reconciliation_error;
+            END IF;
+
+            IF (
+                v_task_errors IS NOT NULL
+                AND (
+                    v_error_details IS NULL
+                    OR v_task_errors <> v_error_details
+                )
+            ) THEN
+                v_error_details := v_task_errors
+                    || COALESCE(' | runner error: ' || v_error_details, '');
             END IF;
 
             BEGIN

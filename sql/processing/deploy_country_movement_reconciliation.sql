@@ -20,6 +20,8 @@ EXECUTE AS OWNER
 AS
 $$
 DECLARE
+    e_reconciliation_failed EXCEPTION
+        (-20082, 'Country routing reconciliation has failed checks');
     v_run_id VARCHAR DEFAULT UUID_STRING();
     v_started_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_country_code VARCHAR(3);
@@ -42,6 +44,8 @@ DECLARE
     v_schema_difference_count NUMBER(38, 0) DEFAULT 0;
     v_failed_check_count NUMBER(38, 0) DEFAULT 0;
     v_overall_status VARCHAR;
+    v_failed_check_details VARCHAR;
+    v_error_details VARCHAR;
     c_approved_country_tables CURSOR FOR
         SELECT
             column1::VARCHAR(3) AS COUNTRY_CODE,
@@ -488,6 +492,21 @@ BEGIN
 
     v_overall_status := IFF(v_failed_check_count = 0, 'PASSED', 'FAILED');
 
+    IF (v_failed_check_count > 0) THEN
+        SELECT LISTAGG(
+                   CHECK_NAME || ' (failures=' || FAILURE_COUNT || '): '
+                       || COALESCE(ERROR_DETAILS, ''),
+                   '; '
+               ) WITHIN GROUP (ORDER BY CHECK_NAME)
+          INTO :v_failed_check_details
+          FROM SKYPOINTS_DB.CORE.COUNTRY_RECONCILIATION_CHECKS
+         WHERE STATUS = 'FAILED';
+
+        v_error_details := 'Country routing reconciliation failed; failed_check_count='
+            || v_failed_check_count || '; ' || v_failed_check_details;
+        RAISE e_reconciliation_failed;
+    END IF;
+
     RETURN OBJECT_CONSTRUCT(
         'run_id', v_run_id,
         'status', v_overall_status,
@@ -504,7 +523,7 @@ EXCEPTION
                 'RECONCILIATION_EXECUTION' AS CHECK_NAME,
                 'FAILED' AS STATUS,
                 1::NUMBER(38, 0) AS FAILURE_COUNT,
-                :SQLERRM AS ERROR_DETAILS
+                COALESCE(:v_error_details, :SQLERRM) AS ERROR_DETAILS
         ) AS source
            ON target.RUN_ID = source.RUN_ID
           AND target.CHECK_NAME = source.CHECK_NAME

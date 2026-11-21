@@ -191,6 +191,46 @@ def test_reconciliation_is_persistent_idempotent_and_does_not_repair_data() -> N
     assert "DELETE FROM IDENTIFIER" not in procedure
 
 
+def test_reconciliation_fails_after_persisting_failed_checks() -> None:
+    procedure = RECONCILIATION.split(
+        "CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING()",
+        1,
+    )[1].split(
+        "CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_COUNTRY_RECONCILIATION",
+        1,
+    )[0]
+    audit_merge = procedure.index(
+        "MERGE INTO SKYPOINTS_DB.AUDIT.COUNTRY_RECONCILIATION_AUDIT"
+    )
+    failed_check_raise = procedure.index("RAISE e_reconciliation_failed;")
+
+    assert "e_reconciliation_failed EXCEPTION" in procedure
+    assert "v_overall_status := IFF(v_failed_check_count = 0, 'PASSED', 'FAILED')" in procedure
+    assert "IF (v_failed_check_count > 0) THEN" in procedure
+    assert audit_merge < failed_check_raise
+    assert procedure.index("RETURN OBJECT_CONSTRUCT(") > failed_check_raise
+    assert "'status', v_overall_status" in procedure
+    assert "'RECONCILIATION_EXECUTION' AS CHECK_NAME" in procedure
+    assert "COALESCE(:v_error_details, :SQLERRM) AS ERROR_DETAILS" in procedure
+    assert "RAISE;" in procedure
+
+
+def test_reconciliation_returns_passed_when_no_checks_fail() -> None:
+    procedure = RECONCILIATION.split(
+        "CREATE OR REPLACE PROCEDURE SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING()",
+        1,
+    )[1].split(
+        "CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_COUNTRY_RECONCILIATION",
+        1,
+    )[0]
+    fail_guard = procedure.index("IF (v_failed_check_count > 0) THEN")
+    passed_return = procedure.index("RETURN OBJECT_CONSTRUCT(")
+
+    assert "v_overall_status := IFF(v_failed_check_count = 0, 'PASSED', 'FAILED')" in procedure
+    assert fail_guard < passed_return
+    assert "'status', v_overall_status" in procedure
+
+
 def test_reconciliation_task_is_downstream_suspended_and_manually_executed() -> None:
     task = RECONCILIATION.split(
         "CREATE OR REPLACE TASK SKYPOINTS_DB.RAW.TASK_COUNTRY_RECONCILIATION",
@@ -211,6 +251,7 @@ def test_reconciliation_task_is_downstream_suspended_and_manually_executed() -> 
     ) < PIPELINE_DEPLOYMENT.index(
         "TASK_COUNTRY_ROUTING SUSPEND"
     )
+    assert "EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT" in PIPELINE_DEPLOYMENT
     assert "CALL SKYPOINTS_DB.AUDIT.SP_RUN_COMPLETE_PIPELINE()" in EXECUTION
 
 

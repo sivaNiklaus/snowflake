@@ -21,8 +21,12 @@ def test_dcm_definitions_declare_required_foundation_objects() -> None:
         ROOT / "sources" / "definitions" / "01_foundation.sql"
     ).read_text(encoding="utf-8")
 
-    assert re.search(r"(?im)^DEFINE DATABASE SKYPOINTS_DB\b", definitions)
-    for schema in ("RAW", "STAGING", "CORE", "ANALYTICS", "AUDIT"):
+    assert not re.search(r"(?im)^DEFINE DATABASE SKYPOINTS_DB\b", definitions)
+    assert not re.search(
+        r"(?im)^DEFINE SCHEMA SKYPOINTS_DB\.AUDIT\b",
+        definitions,
+    )
+    for schema in ("RAW", "STAGING", "CORE", "ANALYTICS"):
         assert re.search(
             rf"(?im)^DEFINE SCHEMA SKYPOINTS_DB\.{schema}\b",
             definitions,

@@ -90,6 +90,21 @@ def test_unified_runner_prevents_overlapping_graph_runs_and_reports_run_id() -> 
     assert "v_success_count <> 9" in PIPELINE_DEPLOYMENT
 
 
+def test_reconciliation_failure_is_a_failed_graph_and_is_audited() -> None:
+    assert "EXECUTE TASK SKYPOINTS_DB.RAW.TASK_MEMBER_INGESTION AWAIT" in PIPELINE_DEPLOYMENT
+    assert "v_error_details := COALESCE(v_error_details, SQLERRM)" in PIPELINE_DEPLOYMENT
+    assert "v_failed_tasks" in PIPELINE_DEPLOYMENT
+    assert "v_task_errors" in PIPELINE_DEPLOYMENT
+    assert "COUNTRY_RECONCILIATION_AUDIT" in PIPELINE_DEPLOYMENT
+    assert "CHECK_NAME = 'RECONCILIATION_EXECUTION'" in PIPELINE_DEPLOYMENT
+    assert "v_error_details := v_task_errors" in PIPELINE_DEPLOYMENT
+    assert "STATUS = 'FAILED'" in PIPELINE_DEPLOYMENT
+    assert "FAILED_TASKS = :v_failed_tasks" in PIPELINE_DEPLOYMENT
+    assert "ERROR_DETAILS = :v_error_details" in PIPELINE_DEPLOYMENT
+    assert "v_success_count <> 9 OR v_failed_task_count > 0" in PIPELINE_DEPLOYMENT
+    assert "RAISE;" in PIPELINE_DEPLOYMENT
+
+
 def test_raw_copy_and_ingestion_audits_are_retry_idempotent() -> None:
     assert TASK_DEPLOYMENT.count("COPY INTO SKYPOINTS_DB.RAW.") == 2
     assert "FORCE = TRUE" not in TASK_DEPLOYMENT.upper()
@@ -195,6 +210,22 @@ def test_unified_monitoring_reports_task_failures_incremental_counts_and_core_to
     assert "LAG(run.STATUS)" in PIPELINE_MONITORING
     assert "WHERE run.STATUS <> 'SUCCEEDED'" in PIPELINE_MONITORING
     assert "ETL_FILE_STAGE_STATUS" in PIPELINE_MONITORING
+
+
+def test_per_run_quarantine_counts_ignore_historical_quarantine_rows() -> None:
+    per_run_dq = PIPELINE_MONITORING.split(
+        "-- Per-run DQ totals", 1
+    )[1].split(
+        "-- Current business-table totals", 1
+    )[0]
+    assert "FROM SKYPOINTS_DB.AUDIT.DQ_EXECUTION AS dq" in per_run_dq
+    assert "FROM SKYPOINTS_DB.AUDIT.DQ_RULE_RESULT" in per_run_dq
+    assert "COUNT(DISTINCT RECORD_KEY) AS QUARANTINED_COUNT" in per_run_dq
+    assert "GROUP BY RUN_ID, DATASET_NAME" in per_run_dq
+    assert "failed_records.RUN_ID = dq.RUN_ID" in per_run_dq
+    assert "JOIN SKYPOINTS_DB.STAGING.DQ_QUARANTINE" not in per_run_dq
+    assert "quarantine.RUN_ID" not in per_run_dq
+    assert "ALL_QUARANTINED_RECORDS" in PIPELINE_MONITORING
 
 
 def test_phase7_documentation_covers_run_recovery_and_snowflake_limits() -> None:

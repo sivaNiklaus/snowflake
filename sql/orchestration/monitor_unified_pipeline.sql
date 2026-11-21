@@ -91,7 +91,8 @@ FROM SKYPOINTS_DB.AUDIT.INGESTION_AUDIT AS audit
 ORDER BY audit.STARTED_AT DESC
 LIMIT 300;
 
--- Per-graph DQ totals, including valid, invalid, duplicate, and quarantined rows.
+-- Per-run DQ totals; failed rule results are distinct-counted per record.
+-- The separate live snapshot below retains lifetime quarantine visibility.
 SELECT
     dq.RUN_ID AS GRAPH_RUN_ID,
     dq.DATASET_NAME,
@@ -100,23 +101,20 @@ SELECT
     dq.VALID_RECORDS,
     dq.INVALID_RECORDS,
     dq.DUPLICATE_COUNT,
-    COALESCE(quarantine.QUARANTINED_COUNT, 0) AS QUARANTINED_COUNT,
+    COALESCE(failed_records.QUARANTINED_COUNT, 0) AS QUARANTINED_COUNT,
     dq.ERROR_DETAILS
 FROM SKYPOINTS_DB.AUDIT.DQ_EXECUTION AS dq
 LEFT JOIN
 (
-    SELECT result.RUN_ID, result.DATASET_NAME,
-           COUNT(DISTINCT result.RECORD_KEY) AS QUARANTINED_COUNT
-    FROM SKYPOINTS_DB.AUDIT.DQ_RULE_RESULT AS result
-    JOIN SKYPOINTS_DB.STAGING.DQ_QUARANTINE AS quarantine
-      ON quarantine.DATASET_NAME = result.DATASET_NAME
-     AND quarantine.RECORD_KEY = result.RECORD_KEY
-    WHERE result.DATASET_NAME IN ('MEMBER', 'REDEMPTION')
-      AND result.STATUS = 'FAILED'
-    GROUP BY result.RUN_ID, result.DATASET_NAME
-) AS quarantine
-  ON quarantine.RUN_ID = dq.RUN_ID
- AND quarantine.DATASET_NAME = dq.DATASET_NAME
+    SELECT RUN_ID, DATASET_NAME,
+           COUNT(DISTINCT RECORD_KEY) AS QUARANTINED_COUNT
+    FROM SKYPOINTS_DB.AUDIT.DQ_RULE_RESULT
+    WHERE DATASET_NAME IN ('MEMBER', 'REDEMPTION')
+      AND STATUS = 'FAILED'
+    GROUP BY RUN_ID, DATASET_NAME
+) AS failed_records
+  ON failed_records.RUN_ID = dq.RUN_ID
+ AND failed_records.DATASET_NAME = dq.DATASET_NAME
 ORDER BY dq.STARTED_AT DESC, dq.DATASET_NAME
 LIMIT 300;
 

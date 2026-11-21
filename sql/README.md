@@ -298,8 +298,9 @@ entries `FAILED` after rollback.
 valid-current membership, duplicate/orphan/wrong-country rows, invalid
 destinations, unapproved country tables, configuration integrity, and country
 table column compatibility with `CORE.MEMBER_CURRENT`. It stores one result
-per check in `AUDIT.COUNTRY_RECONCILIATION_AUDIT`, returns an overall status,
-and does not repair discrepancies.
+per check in `AUDIT.COUNTRY_RECONCILIATION_AUDIT` and does not repair
+discrepancies. A clean run returns `PASSED`; one or more failed checks raise
+after all individual check results are persisted, so the task graph fails.
 
 `TASK_COUNTRY_RECONCILIATION` follows `TASK_COUNTRY_ROUTING`; the routing task
 remains after `TASK_REDEMPTION_PROCESSING`. Both use `SKYPOINTS_ETL_WH`, are
@@ -326,6 +327,10 @@ routing quarantine reasons. Reconciliation can also be run independently:
 ```sql
 CALL SKYPOINTS_DB.AUDIT.SP_VALIDATE_COUNTRY_ROUTING();
 ```
+
+The procedure raises on failed checks only after recording the per-check
+results in `COUNTRY_RECONCILIATION_AUDIT`; inspect those rows after the call
+fails.
 
 Phase 6A-6C tests are static contract tests only:
 
@@ -395,9 +400,10 @@ snow sql --connection <connection_name> --filename sql/orchestration/monitor_uni
 
 The queries report recent graph and task outcomes/durations, run comparisons,
 ingested source files and row counts, stage-level progress and failures, DQ
-valid/invalid/duplicate counts, quarantine totals, live core-table totals,
-country routing/movement counts, reconciliation status, and task/procedure
-errors. `SKYPOINTS_DB.AUDIT.PIPELINE_RUN_AUDIT`,
+valid/invalid/duplicate counts, per-run quarantine counts from that run's
+distinct failed `DQ_RULE_RESULT` records, lifetime quarantine totals, live
+core-table totals, country routing/movement counts, reconciliation status,
+and task/procedure errors. `SKYPOINTS_DB.AUDIT.PIPELINE_RUN_AUDIT`,
 `PIPELINE_RUN_CONTROL`, and `ETL_FILE_STAGE_STATUS` are the principal Phase 7
 audit objects; country and Phase 4-5 details remain in their existing audit
 tables.
