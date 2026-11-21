@@ -32,11 +32,36 @@ def test_exactly_twenty_approved_country_codes_are_seeded_idempotently() -> None
     )[1].split(";", 1)[0]
     seeded = re.findall(r"\('([A-Z]{3})'\)", seed)
     assert seeded == APPROVED_COUNTRIES
-    assert "WHEN MATCHED THEN UPDATE SET\n    TARGET_TABLE = source.TARGET_TABLE" in seed
+    assert "WHEN MATCHED THEN UPDATE" not in seed
+    assert "TARGET_TABLE = source.TARGET_TABLE" not in seed
     assert "IS_ACTIVE = source" not in seed
     assert "WHEN NOT MATCHED THEN INSERT" in seed
     assert "IS_ACTIVE, CREATED_AT, UPDATED_AT" in seed
     assert "TRUE," in seed
+
+
+def test_duplicate_country_configuration_is_detected_before_routing() -> None:
+    assert "HAVING COUNT(*) > 1" in ROUTING_DEPLOYMENT
+    assert "v_duplicate_config_count > 0" in ROUTING_DEPLOYMENT
+    assert "duplicate_country_codes=" in ROUTING_DEPLOYMENT
+
+
+def test_invalid_target_names_fail_before_identifier_usage_and_are_audited() -> None:
+    assert "v_missing_config_count > 0" in ROUTING_DEPLOYMENT
+    assert "v_unapproved_config_count > 0" in ROUTING_DEPLOYMENT
+    assert "v_invalid_target_count > 0" in ROUTING_DEPLOYMENT
+    assert "TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE)" in ROUTING_DEPLOYMENT
+    assert "RAISE e_invalid_country_config;" in ROUTING_DEPLOYMENT
+    assert (
+        "Country routing configuration validation failed: duplicate_country_codes="
+        in ROUTING_DEPLOYMENT
+    )
+    assert "ERROR_DETAILS = COALESCE(:v_config_error, :SQLERRM)" in ROUTING_DEPLOYMENT
+    validation_position = ROUTING_DEPLOYMENT.index("v_duplicate_config_count > 0")
+    identifier_position = ROUTING_DEPLOYMENT.index(
+        "CREATE TABLE IF NOT EXISTS IDENTIFIER(:v_target_fqn)"
+    )
+    assert validation_position < identifier_position
 
 
 def test_country_decisions_reject_missing_unsupported_and_inactive_codes() -> None:
@@ -116,9 +141,25 @@ def test_route_merges_before_transactional_removal_and_tracks_operation_counts()
     assert "v_updated_count := v_updated_count + v_country_updates" in ROUTING_DEPLOYMENT
     assert "v_removed_count := v_removed_count + v_country_removals" in ROUTING_DEPLOYMENT
     assert "v_routed_members := 0;" in ROUTING_DEPLOYMENT
-    assert "ERROR_DETAILS = :SQLERRM" in ROUTING_DEPLOYMENT
+    assert "ERROR_DETAILS = COALESCE(:v_config_error, :SQLERRM)" in ROUTING_DEPLOYMENT
     assert "RAISE;" in ROUTING_DEPLOYMENT
     assert "MEMBER_HISTORY" not in ROUTING_DEPLOYMENT
+
+
+def test_invalid_destination_quarantines_but_preserves_existing_country_rows() -> None:
+    cleanup = ROUTING_DEPLOYMENT.split(
+        "-- All valid destinations are merged before stale country rows are removed.",
+        1,
+    )[1]
+    delete_statement = cleanup.split("DELETE FROM IDENTIFIER(:v_target_fqn)", 1)[1].split(
+        ";", 1
+    )[0]
+    assert "FAILURE_REASON IS NULL" in delete_statement
+    assert "FAILURE_REASON IS NOT NULL" not in delete_statement
+    assert "NORMALIZED_COUNTRY IS DISTINCT FROM :v_country_code" in delete_statement
+    assert "MEMBER_ID NOT IN" in delete_statement
+    assert "FROM SKYPOINTS_DB.CORE.MEMBER_CURRENT" in delete_statement
+    assert "WHERE FAILURE_REASON IS NOT NULL" in ROUTING_DEPLOYMENT
 
 
 def test_country_routing_task_follows_phase45_and_remains_manual() -> None:

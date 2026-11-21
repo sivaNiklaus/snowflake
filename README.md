@@ -161,14 +161,16 @@ USA, IND, GBR, CAN, AUS, DEU, FRA, JPN, SGP, NZL,
 ZAF, BRA, MEX, ARE, SAU, KOR, ITA, ESP, NLD, CHE
 ```
 
-Redeployment canonicalizes each `TARGET_TABLE` to `MEMBER_<COUNTRY_CODE>` but
-preserves administrator changes to `IS_ACTIVE`. Codes outside this allowlist
+Redeployment inserts missing approved entries but does not update existing
+`TARGET_TABLE` or administrator-managed `IS_ACTIVE` values. Before routing,
+the procedure fails closed and records an audit error if it finds duplicate
+country codes, missing approved entries, unapproved countries, or target names
+that do not exactly match `MEMBER_<COUNTRY_CODE>`. Codes outside this allowlist
 are never routed, even if an extra configuration row is added manually.
 Country tables are created only when an approved, active country has current
 members; each new table is created `LIKE CORE.MEMBER_CURRENT`. Routing uses
-the configured target only after checking the country allowlist and canonical
-table-name pattern, then uses Snowflake `IDENTIFIER()` binding for the
-identifier.
+the configured target only after configuration integrity checks, then uses
+Snowflake `IDENTIFIER()` binding for the identifier.
 
 On each run the router normalizes country codes with `TRIM` and `UPPER`,
 routes only approved active countries, and quarantines missing,
@@ -181,10 +183,12 @@ For country movement, the procedure validates destinations, creates needed
 tables, and merges valid current member rows before deleting stale rows from
 other country outputs. The merges and cleanup are one transaction: an insert
 or update failure rolls back country-output changes and preserves the prior
-country copy. Invalid destinations are quarantined and are not routed; their
-old output rows are removed as part of the same successful cleanup. Each
-execution is recorded in `AUDIT.COUNTRY_ROUTING_AUDIT`, including inserted,
-updated, removed, routed, quarantined, and failed-run counts.
+country copy. Invalid destinations are quarantined and not routed; any existing
+country output for that member is preserved until the member has a valid,
+active, approved destination. Rows for members no longer present in
+`MEMBER_CURRENT` are still removed. Each execution is recorded in
+`AUDIT.COUNTRY_ROUTING_AUDIT`, including inserted, updated, removed, routed,
+quarantined, and failed-run counts.
 
 The new task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
 `SKYPOINTS_ETL_WH`, is created suspended, and adds no schedule. Manually run

@@ -255,10 +255,12 @@ snow sql --connection <connection_name> --filename sql/processing/deploy_country
 The script seeds the exact approved alpha-3 country list (`USA`, `IND`, `GBR`,
 `CAN`, `AUS`, `DEU`, `FRA`, `JPN`, `SGP`, `NZL`, `ZAF`, `BRA`, `MEX`, `ARE`,
 `SAU`, `KOR`, `ITA`, `ESP`, `NLD`, `CHE`). Its `MERGE` preserves each
-administrator's `IS_ACTIVE` flag on redeployment and canonicalizes target
-names to `MEMBER_<COUNTRY_CODE>`. The procedure uses only this allowlist,
-validates the configured target pattern, and passes the resulting configured
-identifier through Snowflake `IDENTIFIER()` binding.
+administrator's `IS_ACTIVE` flag and existing target name on redeployment.
+Before routing, the procedure fails closed and records an audit error if it
+finds duplicate codes, missing approved codes, unapproved entries, or target
+names that do not exactly match `MEMBER_<COUNTRY_CODE>`. The procedure uses
+only the allowlist and passes a validated configured identifier through
+Snowflake `IDENTIFIER()` binding.
 
 Country tables are created lazily with `LIKE SKYPOINTS_DB.CORE.MEMBER_CURRENT`
 only for an active approved country with at least one current member. Valid
@@ -272,6 +274,9 @@ Instead, one idempotent record per member/routing condition is merged into
 the existing `STAGING.DQ_QUARANTINE` table under dataset `MEMBER_ROUTING`, with
 the original source line, a full current-member JSON snapshot, and the reason
 `MISSING_COUNTRY`, `UNSUPPORTED_COUNTRY`, or `INACTIVE_COUNTRY`.
+An existing country-table row for such a member is preserved until the member
+has a valid destination; rows are still removed when their member no longer
+exists in `MEMBER_CURRENT`.
 
 The task is chained after `TASK_REDEMPTION_PROCESSING`; it uses
 `SKYPOINTS_ETL_WH`, is suspended on deployment, and has no schedule. Manually

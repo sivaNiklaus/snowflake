@@ -25,9 +25,6 @@ USING
         ('KOR'), ('ITA'), ('ESP'), ('NLD'), ('CHE')
 ) AS source
 ON target.COUNTRY_CODE = source.COUNTRY_CODE
-WHEN MATCHED THEN UPDATE SET
-    TARGET_TABLE = source.TARGET_TABLE,
-    UPDATED_AT = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
 WHEN NOT MATCHED THEN INSERT
 (
     COUNTRY_CODE, TARGET_TABLE, IS_ACTIVE, CREATED_AT, UPDATED_AT
@@ -63,7 +60,7 @@ AS
 $$
 DECLARE
     e_invalid_country_config EXCEPTION
-        (-20006, 'Approved country routing configuration has an invalid target table name');
+        (-20006, 'Country routing configuration failed integrity validation');
     v_run_id VARCHAR DEFAULT UUID_STRING();
     v_started_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP();
     v_total_members NUMBER(38, 0) DEFAULT 0;
@@ -72,7 +69,11 @@ DECLARE
     v_updated_count NUMBER(38, 0) DEFAULT 0;
     v_removed_count NUMBER(38, 0) DEFAULT 0;
     v_quarantined_count NUMBER(38, 0) DEFAULT 0;
-    v_bad_config_count NUMBER(38, 0) DEFAULT 0;
+    v_duplicate_config_count NUMBER(38, 0) DEFAULT 0;
+    v_missing_config_count NUMBER(38, 0) DEFAULT 0;
+    v_unapproved_config_count NUMBER(38, 0) DEFAULT 0;
+    v_invalid_target_count NUMBER(38, 0) DEFAULT 0;
+    v_config_error VARCHAR;
     v_country_code VARCHAR(3);
     v_target_table VARCHAR;
     v_target_fqn VARCHAR;
@@ -114,15 +115,60 @@ BEGIN
     );
 
     SELECT COUNT(*)
-      INTO :v_bad_config_count
-      FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
-     WHERE COUNTRY_CODE IN
+      INTO :v_duplicate_config_count
+      FROM
+      (
+          SELECT COUNTRY_CODE
+          FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
+          GROUP BY COUNTRY_CODE
+          HAVING COUNT(*) > 1
+      ) AS duplicate_codes;
+
+    SELECT COUNT(*)
+      INTO :v_missing_config_count
+      FROM VALUES
+          ('USA'), ('IND'), ('GBR'), ('CAN'), ('AUS'),
+          ('DEU'), ('FRA'), ('JPN'), ('SGP'), ('NZL'),
+          ('ZAF'), ('BRA'), ('MEX'), ('ARE'), ('SAU'),
+          ('KOR'), ('ITA'), ('ESP'), ('NLD'), ('CHE')
+          AS expected(COUNTRY_CODE)
+     WHERE NOT EXISTS
      (
-        'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
-        'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
-     )
-       AND TARGET_TABLE <> 'MEMBER_' || COUNTRY_CODE;
-    IF (v_bad_config_count > 0) THEN
+         SELECT 1
+         FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG AS configured
+         WHERE configured.COUNTRY_CODE = expected.COUNTRY_CODE
+     );
+
+    SELECT COUNT(*)
+      INTO :v_unapproved_config_count
+      FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
+     WHERE COUNTRY_CODE IS NULL
+        OR COUNTRY_CODE NOT IN
+        (
+            'USA', 'IND', 'GBR', 'CAN', 'AUS', 'DEU', 'FRA', 'JPN', 'SGP', 'NZL',
+            'ZAF', 'BRA', 'MEX', 'ARE', 'SAU', 'KOR', 'ITA', 'ESP', 'NLD', 'CHE'
+        );
+
+    SELECT COUNT(*)
+      INTO :v_invalid_target_count
+      FROM SKYPOINTS_DB.AUDIT.COUNTRY_ROUTING_CONFIG
+     WHERE TARGET_TABLE IS DISTINCT FROM ('MEMBER_' || COUNTRY_CODE);
+
+    IF (
+        v_duplicate_config_count > 0
+        OR v_missing_config_count > 0
+        OR v_unapproved_config_count > 0
+        OR v_invalid_target_count > 0
+    ) THEN
+        v_config_error :=
+            'Country routing configuration validation failed: duplicate_country_codes='
+            || v_duplicate_config_count
+            || ', missing_approved_countries='
+            || v_missing_config_count
+            || ', unapproved_country_codes='
+            || v_unapproved_config_count
+            || ', invalid_target_table_names='
+            || v_invalid_target_count;
         RAISE e_invalid_country_config;
     END IF;
 
@@ -432,8 +478,8 @@ BEGIN
                    (
                        SELECT MEMBER_ID
                        FROM SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS
-                       WHERE FAILURE_REASON IS NOT NULL
-                          OR NORMALIZED_COUNTRY IS DISTINCT FROM :v_country_code
+                       WHERE FAILURE_REASON IS NULL
+                         AND NORMALIZED_COUNTRY IS DISTINCT FROM :v_country_code
                    );
 
             DELETE FROM IDENTIFIER(:v_target_fqn)
@@ -443,8 +489,8 @@ BEGIN
                    (
                        SELECT MEMBER_ID
                        FROM SKYPOINTS_DB.CORE.COUNTRY_ROUTING_DECISIONS
-                       WHERE FAILURE_REASON IS NOT NULL
-                          OR NORMALIZED_COUNTRY IS DISTINCT FROM :v_country_code
+                       WHERE FAILURE_REASON IS NULL
+                         AND NORMALIZED_COUNTRY IS DISTINCT FROM :v_country_code
                    );
 
             v_removed_count := v_removed_count + v_country_removals;
@@ -493,7 +539,7 @@ EXCEPTION
                UPDATED_COUNT = :v_updated_count,
                REMOVED_COUNT = :v_removed_count,
                QUARANTINED_COUNT = :v_quarantined_count,
-               ERROR_DETAILS = :SQLERRM
+               ERROR_DETAILS = COALESCE(:v_config_error, :SQLERRM)
          WHERE RUN_ID = :v_run_id;
         RAISE;
 END;
