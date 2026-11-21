@@ -123,7 +123,7 @@ class MockSnow:
             content = Path(script).read_text(encoding="utf-8")
             self.sql_contents.append(content)
             if "/skypoints-lifecycle-" in normalized:
-                if "CURRENT_ACCOUNT()" in content:
+                if "CURRENT_ORGANIZATION_NAME()" in content:
                     self.identity_sql = content
                 elif "DESC DATABASE " in content and "DESC INTEGRATION " in content:
                     self.preflight_sql = content
@@ -252,6 +252,23 @@ def test_target_yaml_drives_rendered_dcm_and_standalone_sql(
     assert "DESC DATABASE SKYPOINTS_TEST_DB" in fake.preflight_sql
 
 
+def test_identity_preflight_uses_org_and_account_name_not_account_locator(
+    tmp_path: Path,
+) -> None:
+    fake = MockSnow()
+    manager = make_manager(tmp_path, fake)
+
+    manager._identity_preflight()
+
+    assert "COALESCE(UPPER(CURRENT_ORGANIZATION_NAME()), '')" in fake.identity_sql
+    assert "COALESCE(UPPER(CURRENT_ACCOUNT_NAME()), '')" in fake.identity_sql
+    assert "UPPER('GIMFDUR')" in fake.identity_sql
+    assert "UPPER('DY25356')" in fake.identity_sql
+    assert "SR48282" not in fake.identity_sql
+    assert "CURRENT_ACCOUNT()" not in fake.identity_sql
+    assert "CURRENT_ROLE() <> 'ACCOUNTADMIN'" in fake.identity_sql
+
+
 def test_destroy_plan_uses_target_config_and_preserves_external_resources(
     tmp_path: Path,
 ) -> None:
@@ -314,8 +331,12 @@ def test_deploy_orders_dcm_and_standalone_sql_without_running_pipeline(
     assert "DESC SCHEMA SKYPOINTS_DB.AUDIT" in fake.preflight_sql
     assert "DESC INTEGRATION SKYPOINTS_S3_INT" in fake.preflight_sql
     assert "CURRENT_ROLE() <> 'ACCOUNTADMIN'" in fake.preflight_sql
-    assert "CURRENT_ACCOUNT()" in fake.identity_sql
-    assert "GIMFDUR-DY25356" in fake.identity_sql
+    assert "CURRENT_ORGANIZATION_NAME()" in fake.identity_sql
+    assert "CURRENT_ACCOUNT_NAME()" in fake.identity_sql
+    assert "UPPER('GIMFDUR')" in fake.identity_sql
+    assert "UPPER('DY25356')" in fake.identity_sql
+    assert "CURRENT_ACCOUNT()" not in fake.identity_sql
+    assert "CURRENT_ROLE() <> 'ACCOUNTADMIN'" in fake.identity_sql
     assert any("CREATE DATABASE IF NOT EXISTS SKYPOINTS_DB" in text for text in fake.sql_contents)
     assert any(
         "STORAGE_INTEGRATION = SKYPOINTS_S3_INT" in text

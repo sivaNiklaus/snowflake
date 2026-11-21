@@ -298,6 +298,12 @@ def load_target_config(target: str, root: Path = ROOT) -> TargetConfig:
     account_identifier = str(snowflake["account_identifier"]).strip()
     project_name = str(snowflake["project_name"]).strip()
     project_owner = str(snowflake["project_owner"]).strip()
+    organization_name, separator, account_name = account_identifier.partition("-")
+    if not separator or not organization_name or not account_name:
+        raise LifecycleError(
+            f"config/{normalized}.yml snowflake.account_identifier must use "
+            "the organization-account format."
+        )
 
     if str(snowflake["database"]).upper() != project_name.split(".", 1)[0].upper():
         raise LifecycleError(
@@ -632,17 +638,32 @@ class LifecycleManager:
         self.completed.append(label)
 
     def _identity_preflight(self) -> None:
-        account = self.target.account_identifier.replace("'", "''")
+        organization_name, separator, account_name = (
+            self.target.account_identifier.partition("-")
+        )
+        if not separator or not organization_name or not account_name:
+            raise LifecycleError(
+                "The configured Snowflake account identifier must use the "
+                "organization-account format."
+            )
+        organization_name = organization_name.replace("'", "''")
+        account_name = account_name.replace("'", "''")
         role = self.target.project_owner
         sql = (
             "EXECUTE IMMEDIATE $$\n"
             "DECLARE\n"
             "    e_wrong_account EXCEPTION (-20090, "
-            f"'Lifecycle operation requires Snowflake account {account}');\n"
+            f"'Lifecycle operation requires Snowflake identity "
+            f"{organization_name}-{account_name}');\n"
             "    e_wrong_role EXCEPTION (-20091, "
             f"'Lifecycle operation requires active role {role}');\n"
             "BEGIN\n"
-            f"    IF (UPPER(CURRENT_ACCOUNT()) <> UPPER('{account}')) THEN\n"
+            "    IF (\n"
+            "        COALESCE(UPPER(CURRENT_ORGANIZATION_NAME()), '') "
+            f"<> UPPER('{organization_name}')\n"
+            "        OR COALESCE(UPPER(CURRENT_ACCOUNT_NAME()), '') "
+            f"<> UPPER('{account_name}')\n"
+            "    ) THEN\n"
             "        RAISE e_wrong_account;\n"
             "    END IF;\n"
             f"    IF (CURRENT_ROLE() <> '{role}') THEN\n"
